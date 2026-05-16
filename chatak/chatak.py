@@ -12,7 +12,7 @@ import astropy.units as u
 import pickle
 import os
 import multiprocessing
-from utils import *
+from .utils import *
 
 log2pi = np.log(2. * np.pi)  # ln(2*pi)
 
