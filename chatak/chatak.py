@@ -9,6 +9,8 @@ except ImportError:
 import dynesty
 from dynesty.utils import resample_equal
 import astropy.units as u
+import astropy.constants as con
+from tqdm import tqdm
 import pickle
 import os
 import multiprocessing
@@ -541,6 +543,8 @@ class fit(object):
                         args = vars(DynestySampler).keys()
 
                     d_args = {}
+                    d_args['bound'] = 'multi'
+                    d_args['sample'] = 'rwalk'
                     # Match them with kwargs (kwargs take preference):
                     for arg in args:
                         if arg in kwargs:
@@ -590,6 +594,8 @@ class fit(object):
                         args = vars(DynestySampler).keys()
 
                     d_args = {}
+                    d_args['bound'] = 'multi'
+                    d_args['sample'] = 'rwalk'
                     # Match them with kwargs:
                     for arg in args:
                         if arg in kwargs:
@@ -643,9 +649,25 @@ class fit(object):
                 weights = np.exp(results['logwt'] - results['logz'][-1])
                 posterior_samples = resample_equal(results.samples, weights)
 
-                # Get lnZ:
-                out['lnZ'] = results.logz[-1]
-                out['lnZerr'] = results.logzerr[-1]
+            # Save posterior samples as outputted by Multinest/Dynesty:
+            out['posterior_samples'] = {}
+            out['posterior_samples']['unnamed'] = posterior_samples
+
+            # Save log-likelihood of each of the samples:
+            out['posterior_samples']['loglike'] = np.zeros(posterior_samples.shape[0])
+            for i in tqdm(range(posterior_samples.shape[0])):
+                out['posterior_samples']['loglike'][i] = self.loglike(posterior_samples[i, :])
+
+            pcounter = 0
+            for pname in self.model_parameters:
+                if self.data.priors[pname]['distribution'] != 'fixed':
+                    self.posteriors[pname] = np.median(posterior_samples[:, pcounter])
+                    out['posterior_samples'][pname] = posterior_samples[:, pcounter]
+                    pcounter += 1
+
+            # Get lnZ:
+            out['lnZ'] = results.logz[-1]
+            out['lnZerr'] = results.logzerr[-1]
 
             pickle.dump(out, open(self.pout + self.sampler_prefix + 'posteriors.pkl', 'wb'))
 
@@ -658,7 +680,7 @@ class fit(object):
         if self.pout is not None:
             if not os.path.exists(self.pout + 'posteriors.dat'):
                 outpp = open(self.pout + 'posteriors.dat', 'w')
-                writepp(outpp, out, data.priors)
+                writepp(outpp, out, self.data.priors)
 
     def loglike(self, cube, ndim=None, nparams=None):
         # Evaluate the joint log-likelihood. For this, first extract all inputs:
@@ -836,7 +858,10 @@ class model(object):
                 ### Either mass or surface gravity must be provided.
                 if self.data_dict['mass_fit']:
                     mp = parameter_values['mp'] * u.M_earth
-                    self.models[ins].model_parameters['planet_mass'] = mp.to(u.g).value
+                    #self.models[ins].model_parameters['planet_mass'] = mp.to(u.g).value
+                    # Converting the mass to surface gravity using the radius:
+                    g = ( con.G * mp / ( rp * u.cm )**2 ).to(u.cm / u.s**2).value
+                    self.models[ins].model_parameters['reference_gravity'] = g
                 else:
                     self.models[ins].model_parameters['reference_gravity'] = parameter_values['surfgrav']
 
@@ -863,7 +888,9 @@ class model(object):
 
                 self.model_spec[ins]['wavelength'] = forward_wav_model
                 self.model_spec[ins]['spectrum'] = forward_spec_model + parameter_values['offset_' + ins ]
-                self.model_spec[ins]['variances'] = self.data.depth_err[ins] ** 2 + parameter_values['sigma_w_' + ins ] ** 2
+
+                if 'FORWARD' not in self.data.mode.keys():
+                    self.model_spec[ins]['variances'] = self.data.depth_err[ins] ** 2 + parameter_values['sigma_w_' + ins ] ** 2
 
             else:
                 raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.data.code}")
