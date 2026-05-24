@@ -40,7 +40,7 @@ class load(object):
         self.pressure_points = pressure_points
         
         # CIA (collision-induced absorption) opacities to include in the modeling. 
-        # This should be a list of strings corresponding to the CIA species available in the opacity files (e.g., 'H2-H2', 'H2-He').
+        # This should be a list of strings corresponding to the CIA species available in the opacity files (e.g., 'H2--H2', 'H2--He').
         # I think this is only used for petitRADTRANS, but we can keep it as a general input for now.
         self.cia = cia
 
@@ -110,8 +110,8 @@ class load(object):
 
         ## Calculating the wavelength ranges for each instrument and saving them in the data dictionary.
         for ins in self.instruments:
-            self.data_dict[ins]['wav_min'] = np.min(self.wavelength[ins]) - 1.
-            self.data_dict[ins]['wav_max'] = np.max(self.wavelength[ins]) + 1.
+            self.data_dict[ins]['wav_min'] = np.min(self.wavelength[ins]) - ( 1.2 * np.median( np.diff( self.wavelength[ins] ) ) )
+            self.data_dict[ins]['wav_max'] = np.max(self.wavelength[ins]) + ( 1.2 * np.median( np.diff( self.wavelength[ins] ) ) )
 
         # Initialize the models
         self.init_models()
@@ -682,6 +682,10 @@ class fit(object):
                 outpp = open(self.pout + 'posteriors.dat', 'w')
                 writepp(outpp, out, self.data.priors)
 
+        # Save all results (posteriors) to the self.results object:
+        self.posteriors = out
+        self.model.set_posterior_samples(out['posterior_samples'])
+
     def loglike(self, cube, ndim=None, nparams=None):
         # Evaluate the joint log-likelihood. For this, first extract all inputs:
         pcounter = 0
@@ -761,6 +765,9 @@ class model(object):
         self.rayleigh_inames = {}
         self.tp_inames = {}
 
+        # Define a variable that will save the posterior samples:
+        self.posteriors = None
+
         self.model_spec = {}
 
         for ins in self.instruments:
@@ -821,10 +828,172 @@ class model(object):
         self.evaluate = self.evaluate_model
         self.generate = self.generate_forward_models
 
-    def evaluate_model(self, params):
-        # This function will evaluate the forward model for a given set of parameters and return the model spectrum.
-        # The implementation will depend on the specific forward model code being used (e.g., petitRADTRANS).
-        pass
+    def set_posterior_samples(self, posterior_samples):
+        self.posteriors = posterior_samples
+        self.median_posterior_samples = {}
+        
+        for parameter in self.posteriors.keys():
+            if parameter != 'unnamed':
+                self.median_posterior_samples[parameter] = np.median(self.posteriors[parameter])
+
+        for parameter in self.priors:
+            if self.priors[parameter]['distribution'] == 'fixed':
+                self.median_posterior_samples[parameter] = self.priors[parameter]['hyperparameters']
+        
+        try:
+            self.generate(self.median_posterior_samples, True)
+        except:
+            print(
+                'Warning: model evaluated at the posterior median did not compute properly.'
+            )
+
+
+    def evaluate_model(self, instrument = None, parameter_values = None, all_samples = False, nsamples = 1000, return_samples = False, 
+                       resolution = None, return_err = False, alpha = 0.68):
+        # This function will generate the model spectrum for the given instrument and parameter values, and return the model spectrum. 
+        # If all_samples is True, then it will use all samples to generate the model spectrum (parameter_values should be a dictionary with parameter names as keys and their corresponding samples as values). 
+        # If return_samples is True, then it will also return models created for each samples
+        # If resolution is not None, then it will rebin the model spectrum to the given resolution. 
+        # If return_err is True, then it will also return the error on the model spectrum (which can be calculated using a simple Monte Carlo approach by generating multiple spectra with parameters). 
+        # If alpha is provided, then it will return the credible interval corresponding to that alpha value.
+        
+        ## ------------------ 
+        ##.  First if statement: if parameter_values are given then we will generate the model spectrum for those parameter values.
+        ##.        else statement: if parameter_values are not given, the model spectrum is generated for the posteriors
+        if parameter_values is not None:
+            ## Generate the model spectrum for the given parameter values.
+            #### ---- parameter_values can be np.arrays (i.e., samples) or single values. 
+            parameters = list(self.priors.keys())
+            input_parameters = list(parameter_values.keys())
+            if type(parameter_values[input_parameters[0]]) is np.ndarray:
+                ## This means that the parameter values are samples. We will generate the model spectrum for each sample.
+                ### The user can either use all_samples (i.e., all_samples=True), or we can provide nsamples
+                nsampled = len(parameter_values[input_parameters[0]])
+                if all_samples:
+                    nsamples = nsampled
+                    idx_samples = np.arange(nsamples)
+                else:
+                    idx_samples = np.random.choice(np.arange(nsampled),
+                                                   np.min([nsamples, nsampled]),
+                                                   replace=False)
+                    idx_samples = idx_samples[np.argsort(idx_samples)]
+
+                # Create dictionary that saves the current parameter_values to evaluate:
+                current_parameter_values = dict.fromkeys(parameters)
+                ### Adding the parameters which were fixed in the analysis.
+                for parameter in parameters:
+                    if self.priors[parameter]['distribution'] == 'fixed':
+                        current_parameter_values[parameter] = self.priors[parameter]['hyperparameters']
+
+                if resolution is None:
+                    ## If resolution is None, i.e., we will use the resolution of the data to generate models
+                    output_model_samples = np.zeros([
+                            nsamples,
+                            len( self.data.depth[instrument] )
+                        ])
+                else:
+                    ## If resolution is provided, then we generate models at those resolutions
+                    ### Currently, this means that the default resolution at which the model is created.
+                    ### We don't know the length of wavelength array in that case, 
+                    ### so, let's run generate_forward_models function to generate models at one set of values 
+                    ### and then get the length of array from that.
+                    for parameter in input_parameters:
+                        # Populate the current parameter_values
+                        current_parameter_values[parameter] = parameter_values[parameter][idx_samples[0]]
+                    self.generate_forward_models(current_parameter_values, rebin=False)
+                    output_model_samples = np.zeros([
+                            nsamples,
+                            len( self.model_spec[instrument]['spectrum'] )
+                        ])
+                    
+                    ## Okay if the model resolution is not the same as the data resolution, then we also need to provide wavelengths
+                    output_model_wavelengths = np.zeros( len( self.model_spec[instrument]['spectrum'] ) )
+                
+                # Now iterate through all samples:
+                for i in tqdm(range(len(idx_samples))):
+                    # Get parameters for the i-th sample:
+                    for parameter in input_parameters:
+                        # Populate the current parameter_values
+                        current_parameter_values[parameter] = parameter_values[parameter][idx_samples[i]]
+                    
+                    if resolution is None:
+                        self.generate_forward_models(current_parameter_values, rebin=True)
+                    else:
+                        self.generate_forward_models(current_parameter_values, rebin=False)
+                        output_model_wavelengths = self.model_spec[instrument]['wavelength']
+                    
+                    output_model_samples[i,:] = self.model_spec[instrument]['spectrum']
+                
+                # If return_error is on, return upper and lower sigma (alpha x 100% CI) of the model(s):
+                if return_err:
+                    m_output_model, u_output_model, l_output_model = np.zeros(output_model_samples.shape[1]),\
+                                                                     np.zeros(output_model_samples.shape[1]),\
+                                                                     np.zeros(output_model_samples.shape[1])
+                    
+                    ## Generating quantiles
+                    for i in range(output_model_samples.shape[1]):
+                            m_output_model[i], u_output_model[i], l_output_model[i] = get_quantiles(output_model_samples[:, i], alpha=alpha)
+                else:
+                    output_model = np.nanmedian(output_model_samples, axis=0)
+                    
+            else:
+                ## This means that the parameter values are single values. We will generate the model spectrum for those values.
+                if resolution is None:
+                    self.generate_forward_models(parameter_values, rebin=True)
+                else:
+                    self.generate_forward_models(parameter_values, rebin=False)
+                    output_model_wavelengths = self.model_spec[instrument]['wavelength']
+
+                output_model = self.model_spec[instrument]['spectrum']
+
+        else:
+            ## We will use the posteriors to generate the model spectrum.
+            x = self.evaluate_model(instrument=instrument, parameter_values=self.posteriors, all_samples=all_samples, nsamples=nsamples, return_samples=return_samples, resolution=resolution, return_err=return_err, alpha=alpha)
+            if return_samples:
+                if return_err:
+                    if resolution is None:
+                        output_model_samples, m_output_model, u_output_model, l_output_model = x
+                    else:
+                        output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths = x
+                else:
+                    if resolution is None:
+                        output_model_samples, output_model = x
+                    else:
+                        output_model_samples, output_model, output_model_wavelengths = x
+            else:
+                if return_err:
+                    if resolution is None:
+                        m_output_model, u_output_model, l_output_model = x
+                    else:
+                        m_output_model, u_output_model, l_output_model, output_model_wavelengths = x
+                else:
+                    if resolution is None:
+                        output_model = x
+                    else:
+                        output_model, output_model_wavelengths = x
+        
+        if return_samples:
+            if return_err:
+                if resolution is None:
+                    return output_model_samples, m_output_model, u_output_model, l_output_model
+                else:
+                    return output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths
+            else:
+                if resolution is None:
+                    return output_model_samples, output_model
+                else:
+                    return output_model_samples, output_model, output_model_wavelengths
+        else:
+            if return_err:
+                if resolution is None:
+                    return m_output_model, u_output_model, l_output_model
+                else:
+                    return m_output_model, u_output_model, l_output_model, output_model_wavelengths
+            else:
+                if resolution is None:
+                    return output_model
+                else:
+                    return output_model, output_model_wavelengths
 
     def generate_forward_models(self, parameter_values, rebin):
         ## Okay now we want to generate the forward model for each instrument using the parameter values.
