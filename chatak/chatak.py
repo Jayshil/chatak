@@ -6,6 +6,11 @@ try:
 except ImportError:
     print('Warning: petitRADTRANS not found. Forward models from petitRADTRANS cannot be used.')
 
+try:
+    from ultranest import ReactiveNestedSampler
+except:
+    print('Warning: UltraNest not found. UltraNest sampler cannot be used.')
+
 import dynesty
 from dynesty.utils import resample_equal
 import astropy.units as u
@@ -468,7 +473,7 @@ class load(object):
 
 
 class fit(object):
-    def __init__(self, data, rst, sampler='dynesty', nthreads=None, dynesty_save_states=False, dynesty_resume=False, **kwargs):
+    def __init__(self, data, rst, sampler='dynesty', n_live_points=500, nthreads=None, dynesty_save_states=False, dynesty_resume=False, **kwargs):
         # The following line will inherit the data and priors from the load instance and set up the fitting framework.
         self.data = data
 
@@ -477,6 +482,8 @@ class fit(object):
         self.sampler = sampler
         self.nthreads = nthreads
         self.rst = rst
+
+        self.n_live_points = n_live_points
         
         # Inhert the output folder:
         self.pout = data.pout
@@ -486,6 +493,8 @@ class fit(object):
             self.sampler_prefix = '_dynesty_NS_'
         elif self.sampler == 'dynamic_dynesty':
             self.sampler_prefix = '_dynesty_DNS_'
+        else:
+            self.sampler_prefix = self.sampler + '_'
 
         self.dynesty_save_states = dynesty_save_states
         self.dynesty_resume = dynesty_resume
@@ -545,6 +554,7 @@ class fit(object):
                     d_args = {}
                     d_args['bound'] = 'multi'
                     d_args['sample'] = 'rwalk'
+                    d_args['nlive'] = self.n_live_points
                     # Match them with kwargs (kwargs take preference):
                     for arg in args:
                         if arg in kwargs:
@@ -596,6 +606,7 @@ class fit(object):
                     d_args = {}
                     d_args['bound'] = 'multi'
                     d_args['sample'] = 'rwalk'
+                    d_args['nlive'] = self.n_live_points
                     # Match them with kwargs:
                     for arg in args:
                         if arg in kwargs:
@@ -648,6 +659,66 @@ class fit(object):
                 # Get weighted posterior:
                 weights = np.exp(results['logwt'] - results['logz'][-1])
                 posterior_samples = resample_equal(results.samples, weights)
+
+            elif 'ultranest' in self.sampler:
+
+                # Match kwargs to possible ReactiveNestedSampler keywords. First, extract possible arguments of ReactiveNestedSampler:
+                args = ReactiveNestedSampler.__init__.__code__.co_varnames
+                rns_args = {}
+                # First, define some standard ones:
+                rns_args['transform'] = self.prior_transform_r
+                rns_args['log_dir'] = self.pout
+                rns_args['resume'] = True
+                # Now extract arguments from kwargs; they take presedence over the standard ones above:
+                for arg in args:
+                    if arg in kwargs:
+                        rns_args[arg] = kwargs[arg]
+                # ...and load the sampler:
+                sampler = ReactiveNestedSampler(self.paramnames, self.loglike,
+                                                **rns_args)
+
+                if 'slicesampler' in self.sampler:
+                    import ultranest.stepsampler
+
+                    # Match kwarfs to possible args in RegionSliceSampler:
+                    args = ultranest.stepsampler.SliceSampler.__init__.__code__.co_varnames
+                    rss_args = {}
+                    # First, define standard ones:
+                    rss_args['nsteps'] = 400
+                    rss_args['adaptive_nsteps'] = 'move-distance'
+                    # Extract kwargs, add them in:
+                    for arg in args:
+                        if arg in kwargs:
+                            rss_args[arg] = kwargs[arg]
+
+                    # Apply stepsampler:
+                    sampler.stepsampler = ultranest.stepsampler.RegionSliceSampler(
+                        **rss_args)
+
+                # Now do the same for ReactiveNestedSampler.run --- load any kwargs the user has given as input:
+                args = ReactiveNestedSampler.run.__code__.co_varnames
+                rns_run_args = {}
+                # Define some standard ones:
+                rns_run_args['frac_remain'] = 0.1
+                rns_run_args['min_num_live_points'] = self.n_live_points
+                rns_run_args['max_num_improvement_loops'] = 1
+                # Load the ones from the kwargs:
+                for arg in args:
+                    if arg in kwargs:
+                        rns_run_args[arg] = kwargs[arg]
+                # Run the sampler:
+                results = sampler.run(**rns_run_args)
+                sampler.print_results()
+                sampler.plot()
+
+                # Save ultranest outputs:
+                out['ultranest_output'] = results
+                # Get weighted posterior:
+                posterior_samples = results['samples']
+                # Get lnZ:
+                out['lnZ'] = results['logz']
+                out['lnZerr'] = results['logzerr']
+            
 
             # Save posterior samples as outputted by Multinest/Dynesty:
             out['posterior_samples'] = {}
