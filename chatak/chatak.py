@@ -464,9 +464,32 @@ class load(object):
             else:
                 raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.code}")
     
-    def generate_forward_models(self, **kwargs):
+    def generate_forward_models(self, save=True, **kwargs):
         # This function will generate forward models using model class.
-        return model(self, **kwargs)
+        ## ------ Loading the model class.
+        mod = model(self, **kwargs)
+
+        ## Creating the parameter dictionary from the priors.
+        post = {}
+        for i in self.priors.keys():
+            post[i] = self.priors[i]['hyperparameters']
+
+        ## ------- Calculating the forward model for the given parameters.
+        mod.generate_forward_models(parameter_values=post, rebin=False)
+
+        ## ------- Extracting the forward model
+        forward_wavelength = mod.model_spec['FORWARD']['wavelength']
+        forward_spectrum = mod.model_spec['FORWARD']['spectrum']
+
+        ## ------- Saving the forward model if save is True.
+        if save:
+            forward_path = os.path.join(self.pout, 'forward_model.txt')
+            with open(forward_path, 'w') as f:
+                f.write('# wavelength_micron spectrum [ppm]\n')
+                for w, s in zip(forward_wavelength, forward_spectrum):
+                    f.write(f'{w:.16e} {s:.16e}\n')
+
+        return forward_wavelength, forward_spectrum
 
     def fit(self, **kwargs):
         return fit(self, **kwargs)
