@@ -473,7 +473,7 @@ class load(object):
 
 
 class fit(object):
-    def __init__(self, data, rst, sampler='dynesty', n_live_points=500, nthreads=None, dynesty_save_states=False, dynesty_resume=False, **kwargs):
+    def __init__(self, data, sampler='dynesty', n_live_points=500, nthreads=None, dynesty_save_states=False, dynesty_resume=False, **kwargs):
         # The following line will inherit the data and priors from the load instance and set up the fitting framework.
         self.data = data
 
@@ -481,7 +481,6 @@ class fit(object):
         self.results = None
         self.sampler = sampler
         self.nthreads = nthreads
-        self.rst = rst
 
         self.n_live_points = n_live_points
         
@@ -522,7 +521,7 @@ class fit(object):
         self.transform_prior = {}
         self.set_prior_transform()
 
-        self.model = model(self.data, rst=self.rst)
+        self.model = model(self.data)
 
         # First, check if a run has already been performed with the user-defined sampler. If it hasn't, run it.
         # If it has (detected through its output filename), skip running again and jump straight to loading the
@@ -815,12 +814,9 @@ class fit(object):
         return transformed_priors
 
 class model(object):
-    def __init__(self, data, rst):
+    def __init__(self, data):
         # The following line will inherit the data and priors from the load instance and set up the forward modeling framework.
         self.data = data
-        self.rst = rst
-
-        self.rst_cm = ( self.rst * u.R_sun ).to(u.cm).value
         
         ## Redefining several variables for easier access.
         self.instruments = self.data.instruments
@@ -1091,8 +1087,11 @@ class model(object):
                     self.models[ins].model_parameters['filling_species'][rs] = parameter_values[ 'rayleigh-' + rs + self.rayleigh_inames[ins] ]
 
                 ## Setting up other planetary parameters
-                ### Calculating the stellar radius in cm
-                rp = ( parameter_values['rprs'] * self.rst * u.R_sun ).to(u.cm).value
+                ### Calculating and extracting the stellar radius in cm
+                rst = parameter_values['rst']
+                rst_cm = ( rst * u.R_sun ).to(u.cm).value
+
+                rp = ( parameter_values['rprs'] * rst * u.R_sun ).to(u.cm).value
                 self.models[ins].model_parameters['planet_radius'] = rp
 
                 ### Either mass or surface gravity must be provided.
@@ -1119,7 +1118,7 @@ class model(object):
                     forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin)
 
                     forward_wav_model = ( forward_wav_model[0,:] * u.cm ).to(u.micron).value
-                    forward_spec_model = ( ( forward_spec_model[0,:] / self.rst_cm )**2 ) * 1e6
+                    forward_spec_model = ( ( forward_spec_model[0,:] / rst_cm )**2 ) * 1e6
 
                 # We don't need offset and sigma_w for forward models
                 if 'FORWARD' in self.data.mode.keys():
