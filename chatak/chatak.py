@@ -25,7 +25,7 @@ log2pi = np.log(2. * np.pi)  # ln(2*pi)
 
 class load(object):
     def __init__(self, wavelength=None, depth=None, depth_err=None, wav_band=None, res_func=None, priors=None, mode=None,\
-                 pressure_range=[-6, 2], pressure_points=100, cia=[], code='petit', pout=None, pin=None, verbose=False):
+                 pressure_range=[-6, 2], pressure_points=100, cia=[], resolution='c-k', code='petit', pout=None, pin=None, verbose=False):
         # Normal runs save wavelength-space inputs and per-instrument modes.
         # Forward runs only need priors and output location.
         self.wavelength = wavelength
@@ -38,6 +38,7 @@ class load(object):
         self.pin = pin
         self.mode = mode
         self.instruments = []
+        self.resolution = resolution
 
         ## Pressure range and resolution (in termns of number of points) to create pressure grid to generate models.
         ## Pressure range is in log10(P) where P is in bar. The pressure grid will be created using np.logspace(pressure_range[0], pressure_range[1], pressure_points).
@@ -63,11 +64,15 @@ class load(object):
             provided = [wavelength, depth, depth_err, wav_band, res_func, priors, pout, mode]
             if any(value is not None for value in provided):
                 raise ValueError('When pin is provided, do not pass wavelength, depth, depth_err, wav_band, res_func, priors, pout, or mode.')
+            if resolution != 'c-k' and resolution is not None:
+                raise ValueError('When pin is provided, do not pass resolution explicitly; it will be restored from disk.')
             self.read()
             if self.pout is None:
                 self.pout = self.pin
             if isinstance(self.mode, str):
                 self.mode = self._normalize_mode(self.mode, self.instruments)
+            if isinstance(self.resolution, (str, int, np.integer)):
+                self.resolution = self._normalize_resolution(self.resolution, self.instruments)
             self.datadict_preparation()
             return
 
@@ -82,6 +87,8 @@ class load(object):
                 os.makedirs(self.pout)
             self.instruments = ['FORWARD']
             self.mode = self._normalize_mode(self.mode, self.instruments)
+            if self.resolution is not None and isinstance(self.resolution, (str, int, np.integer)):
+                self.resolution = self._normalize_resolution(self.resolution, self.instruments)
             self.save()
             self.datadict_preparation()
 
@@ -104,6 +111,9 @@ class load(object):
             raise ValueError('wav_band and res_func must both be provided or both be None.')
 
         self.mode = self._normalize_mode(self.mode, self.wavelength.keys())
+        self.resolution = self._normalize_resolution(self.resolution, self.wavelength.keys())
+        if any(value is None for value in self.resolution.values()):
+            raise ValueError('resolution must be provided for all instruments in normal runs.')
         self._validate_inputs()
         self.instruments = sorted(self.wavelength.keys())
 
@@ -138,6 +148,23 @@ class load(object):
             return normalized
         raise TypeError("mode must be either a dict of instrument modes or the string 'forward'.")
 
+    def _normalize_resolution(self, resolution, instrument_keys):
+        # Allow a single resolution value/string for all instruments or a per-instrument dict.
+        if resolution is None:
+            return {ins: None for ins in instrument_keys}
+        if isinstance(resolution, (str, int, np.integer)):
+            return {ins: resolution for ins in instrument_keys}
+        if isinstance(resolution, dict):
+            if set(resolution.keys()) != set(instrument_keys):
+                raise ValueError('resolution must have the same instrument keys as wavelength, depth, and depth_err.')
+            normalized = {}
+            for ins, value in resolution.items():
+                if not isinstance(value, (str, int, np.integer)):
+                    raise TypeError(f'resolution for instrument {ins} must be a string or integer.')
+                normalized[ins] = value
+            return normalized
+        raise TypeError("resolution must be either a dict, a string, an integer, or None.")
+
     def _validate_priors(self):
         if not isinstance(self.priors, dict):
             raise TypeError('priors must be a dict with parameter names as keys.')
@@ -162,6 +189,11 @@ class load(object):
         if set(self.mode.keys()) != spec_keys:
             raise ValueError('mode must have identical instrument keys as wavelength, depth, and depth_err.')
 
+        if not isinstance(self.resolution, dict):
+            raise TypeError('resolution must be a dict with instrument names as keys for normal runs.')
+        if set(self.resolution.keys()) != spec_keys:
+            raise ValueError('resolution must have identical instrument keys as wavelength, depth, and depth_err.')
+
         for ins in spec_keys:
             w = np.asarray(self.wavelength[ins], dtype=float)
             d = np.asarray(self.depth[ins], dtype=float)
@@ -172,6 +204,8 @@ class load(object):
                 raise ValueError(f'wavelength/depth/depth_err length mismatch for instrument {ins}.')
             if self.mode[ins] not in ['transmission', 'emission']:
                 raise ValueError(f"mode for instrument {ins} must be either 'transmission' or 'emission'.")
+            if self.resolution[ins] is not None and not isinstance(self.resolution[ins], (str, int, np.integer)):
+                raise TypeError(f'resolution for instrument {ins} must be a string or integer.')
 
         if not isinstance(self.wav_band, dict) or not isinstance(self.res_func, dict):
             raise TypeError('wav_band and res_func must be dict objects when provided.')
@@ -251,14 +285,15 @@ class load(object):
             dep = np.asarray(self.depth[ins], dtype=float)
             dep_err = np.asarray(self.depth_err[ins], dtype=float)
             mode = self.mode[ins]
+            resolution = self.resolution[ins]
             # Keep the instrument label in the last column and the per-instrument mode in the fifth.
             for i in range(len(wav)):
-                spectrum_rows.append(f'{wav[i]:.16e} {dep[i]:.16e} {dep_err[i]:.16e} {ins} {mode}')
+                spectrum_rows.append(f'{wav[i]:.16e} {dep[i]:.16e} {dep_err[i]:.16e} {ins} {mode} {resolution}')
 
         self._write_multicolumn_txt(
             spectrum_path,
             spectrum_rows,
-            '# wavelength_micron depth_ppm depth_err_ppm instrument mode',
+            '# wavelength_micron depth_ppm depth_err_ppm instrument mode resolution',
         )
 
         response_rows = []
@@ -320,15 +355,18 @@ class load(object):
         if not os.path.exists(response_path):
             raise FileNotFoundError(f'Missing saved response data file: {response_path}')
 
-        spec_rows = self._read_multicolumn_txt(spectrum_path, expected_cols=5)
-        wavelength, depth, depth_err, mode = {}, {}, {}, {}
+        spec_rows = self._read_multicolumn_txt(spectrum_path, expected_cols=6)
+        wavelength, depth, depth_err, mode, resolution = {}, {}, {}, {}, {}
         for row in spec_rows:
-            w, d, e, ins, ins_mode = row
+            w, d, e, ins, ins_mode, ins_resolution = row
             if ins not in wavelength:
                 wavelength[ins], depth[ins], depth_err[ins] = [], [], []
                 mode[ins] = ins_mode
+                resolution[ins] = ins_resolution
             elif mode[ins] != ins_mode:
                 raise ValueError(f'Inconsistent mode values found for instrument {ins}.')
+            elif resolution[ins] != ins_resolution:
+                raise ValueError(f'Inconsistent resolution values found for instrument {ins}.')
             wavelength[ins].append(float(w))
             depth[ins].append(float(d))
             depth_err[ins].append(float(e))
@@ -337,6 +375,7 @@ class load(object):
         self.depth = {k: np.asarray(v, dtype=float) for k, v in depth.items()}
         self.depth_err = {k: np.asarray(v, dtype=float) for k, v in depth_err.items()}
         self.mode = mode
+        self.resolution = {k: self._parse_resolution_value(v) for k, v in resolution.items()}
         self.instruments = sorted(self.wavelength.keys())
 
         resp_rows = self._read_multicolumn_txt(response_path, expected_cols=3)
@@ -352,6 +391,15 @@ class load(object):
         self.res_func = {k: np.asarray(v, dtype=float) for k, v in res_func.items()}
 
         self._validate_inputs()
+
+    def _parse_resolution_value(self, value):
+        # Try to restore integer resolutions, otherwise keep the original string label.
+        if value is None or value == 'None':
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
 
     def datadict_preparation(self):
         ## This function prepare a data dictionary which will save the fitting type for each instrument.
@@ -386,6 +434,21 @@ class load(object):
 
         # Going through the instruments and checking the priors to set the fitting type, line and cloud species.
         for i in range( len(self.instruments) ):
+
+            if type( self.resolution[self.instruments[i]] ) == int:
+                
+                resolution = '.R' + str( self.resolution[self.instruments[i]] )
+                self.data_dict[ self.instruments[i] ]['opacity_mode'] = 'c-k'
+            
+            else:
+                resolution = ''
+
+                if self.resolution[self.instruments[i]] == 'c-k':
+                    self.data_dict[ self.instruments[i] ]['opacity_mode'] = 'c-k'
+                
+                elif self.resolution[self.instruments[i]] == 'lbl':
+                    self.data_dict[ self.instruments[i] ]['opacity_mode'] = 'lbl'
+
             
             for pri in self.priors.keys():
                 
@@ -403,12 +466,12 @@ class load(object):
                     ## This means that the prior is for a line species.
                     if ( self.instruments[i] in pri.split('_') ) or ( len(pri.split('_')) == 1 ):
                         if pri.split('-')[1][0:3] == 'log':
-                            self.data_dict[ self.instruments[i] ]['line_species'].append( pri.split('-')[1][3:] )
+                            self.data_dict[ self.instruments[i] ]['line_species'].append( pri.split('-')[1][3:] + resolution )
                             self.data_dict[ self.instruments[i] ]['logabundance'] = True
                             if self.verbose:
                                 print(f"Adding line species {pri.split('-')[1][3:]} to instrument {self.instruments[i]} with log-abundance.")
                         else:
-                            self.data_dict[ self.instruments[i] ]['line_species'].append( pri.split('-')[1] )
+                            self.data_dict[ self.instruments[i] ]['line_species'].append( pri.split('-')[1] + resolution )
                             if self.verbose:
                                 print(f"Adding line species {pri.split('-')[1]} to instrument {self.instruments[i]}.")
 
@@ -459,7 +522,8 @@ class load(object):
                                                                    line_species=self.data_dict[ self.instruments[i] ]['line_species'],
                                                                    rayleigh_species=self.data_dict[ self.instruments[i] ]['rayleigh_species'],
                                                                    gas_continuum_contributors=self.cia,
-                                                                   wavelength_boundaries=[self.data_dict[ self.instruments[i] ]['wav_min'], self.data_dict[ self.instruments[i] ]['wav_max']]
+                                                                   wavelength_boundaries=[self.data_dict[ self.instruments[i] ]['wav_min'], self.data_dict[ self.instruments[i] ]['wav_max']],
+                                                                   line_opacity_mode=self.data_dict[ self.instruments[i] ]['opacity_mode']
                                                                   )
             else:
                 raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.code}")
@@ -1098,10 +1162,17 @@ class model(object):
                 ## List of line species for this instrument.
                 self.models[ins].model_parameters['imposed_mass_fractions'] = {}
                 for ls in self.data_dict[ins]['line_species']:
+
+                    ## If the resolution is int, then the name of the species would be something like 'CO2.R200'. 
+                    ## Let's leave resolution out of the name of the species.
+                    if type( self.data.resolution[ins] ) == int:
+                        ls1 = ls.split('.')[0]
+
                     if self.data_dict[ins]['logabundance']:
-                        abundance = 10 ** parameter_values[ 'line-log' + ls + self.line_inames[ins] ]
+                        abundance = 10 ** parameter_values[ 'line-log' + ls1 + self.line_inames[ins] ]
                     else:
-                        abundance = parameter_values[ 'line-' + ls + self.line_inames[ins] ]
+                        abundance = parameter_values[ 'line-' + ls1 + self.line_inames[ins] ]
+                    
                     self.models[ins].model_parameters['imposed_mass_fractions'][ls] = abundance
                 
                 ## List of filling species
