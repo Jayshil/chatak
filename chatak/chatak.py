@@ -3,6 +3,8 @@ import ast
 
 try:
     from petitRADTRANS.spectral_model import SpectralModel
+    from petitRADTRANS.chemistry.utils import compute_mean_molar_masses_from_volume_mixing_ratios
+    from petitRADTRANS.chemistry.utils import volume_mixing_ratios2mass_fractions
 except ImportError:
     print('Warning: petitRADTRANS not found. Forward models from petitRADTRANS cannot be used.')
 
@@ -25,7 +27,8 @@ log2pi = np.log(2. * np.pi)  # ln(2*pi)
 
 class load(object):
     def __init__(self, wavelength=None, depth=None, depth_err=None, wav_band=None, res_func=None, priors=None, mode=None,\
-                 pressure_range=[-6, 2], pressure_points=100, cia=[], resolution='c-k', code='petit', pout=None, pin=None, verbose=False):
+                 pressure_range=[-6, 2], pressure_points=100, cia=[], resolution='c-k', code='petit', petit_vmr=False,\
+                 pout=None, pin=None, verbose=False):
         # Normal runs save wavelength-space inputs and per-instrument modes.
         # Forward runs only need priors and output location.
         self.wavelength = wavelength
@@ -44,6 +47,11 @@ class load(object):
         ## Pressure range is in log10(P) where P is in bar. The pressure grid will be created using np.logspace(pressure_range[0], pressure_range[1], pressure_points).
         self.pressure_range = pressure_range
         self.pressure_points = pressure_points
+
+        ## petitRADTRANS uses mass fractions instead of volume-mixing-ratios. So, by default, the abundances provided by the user
+        ## in case of petit=True, would be assumed to be mass fractions. However, the user can alternatively provide volume-mixing-ratios and 
+        ## set petit_vmr=True. In that case, the abundances will be converted to mass fractions using the mean molecular weight of the atmosphere calculated from the provided abundances.
+        self.petit_vmr = petit_vmr
         
         # CIA (collision-induced absorption) opacities to include in the modeling. 
         # This should be a list of strings corresponding to the CIA species available in the opacity files (e.g., 'H2--H2', 'H2--He').
@@ -1161,25 +1169,85 @@ class model(object):
 
                 ## List of line species for this instrument.
                 self.models[ins].model_parameters['imposed_mass_fractions'] = {}
+
+                ### Saving the total abundaces of the line species
+                total_abundance_lines = 0.0
                 for ls in self.data_dict[ins]['line_species']:
 
                     ## If the resolution is int, then the name of the species would be something like 'CO2.R200'. 
-                    ## Let's leave resolution out of the name of the species.
+                    ## Let's leave resolution out of the name of the species (used in case if petit_vmr is True).
                     if type( self.data.resolution[ins] ) == int:
                         ls1 = ls.split('.')[0]
+                    else:
+                        ls1 = ls
 
                     if self.data_dict[ins]['logabundance']:
                         abundance = 10 ** parameter_values[ 'line-log' + ls1 + self.line_inames[ins] ]
                     else:
                         abundance = parameter_values[ 'line-' + ls1 + self.line_inames[ins] ]
                     
-                    self.models[ins].model_parameters['imposed_mass_fractions'][ls] = abundance
+                    if not self.data.petit_vmr:
+                        ## If petit_vmr is False, then we assume that the user has provided mass fractions directly.
+                        self.models[ins].model_parameters['imposed_mass_fractions'][ls] = abundance
+                    else:
+                        total_abundance_lines += abundance
                 
                 ## List of filling species
                 self.models[ins].model_parameters['filling_species'] = {}
-                for rs in self.data_dict[ins]['rayleigh_species']:
-                    self.models[ins].model_parameters['filling_species'][rs] = parameter_values[ 'rayleigh-' + rs + self.rayleigh_inames[ins] ]
 
+                ### Total ratios of filling species to line species (used in case if petit_vmr is True)
+                total_abundance_ratio_filling = 0.0
+                for rs in self.data_dict[ins]['rayleigh_species']:
+                    if not self.data.petit_vmr:
+                        ## If petit_vmr is False, then we assume that the user has provided mass fractions directly.
+                        self.models[ins].model_parameters['filling_species'][rs] = parameter_values[ 'rayleigh-' + rs + self.rayleigh_inames[ins] ]
+                    else:
+                        total_abundance_ratio_filling += parameter_values[ 'rayleigh-' + rs + self.rayleigh_inames[ins] ]
+
+                ## Okay, now if petit_vmr is True, then the user has provided the abundances in the volume mixing ratio.
+                ## So, we need to convert them back to the mass fractions for petitRADTRANS.
+                ## First, we need to generate a dict containing abundances of all species (line and filling).
+                ## We have the abundances of the line species, but not of the filling species (because we only ask for the ratios of the filling species)
+                ## So, let's first calculate the total abundances of the filling species.
+                ## Some math on how I do this: l1 + l2 + ... + ln + f1 + f2 + ... + fm = 1 (where l are line species and f are filling species); we know l1, l2, ..., ln; we also know f1:f2:...:fm; so, we can calculate f1, f2, ..., fm using the ratios and the total abundance of the line species.
+                ## let's say, f1:f2:...:fm = r1:r2:...:rm; then, f1 = r1 * ( 1 - total_abundance_lines ) / ( r1 + r2 + ... + rm ); f2 = r2 * ( 1 - total_abundance_lines ) / ( r1 + r2 + ... + rm ); ...; fm = rm * ( 1 - total_abundance_lines ) / ( r1 + r2 + ... + rm )
+                ## r1 + r2 + ... + rm is total_abundance_ratio_filling
+                if self.data.petit_vmr:
+                    ## Creating a dict to save the abundances of all species.
+                    all_species_abundances = {}
+                    ## First, add the line species:
+                    for ls in self.data_dict[ins]['line_species']:
+                        if type( self.data.resolution[ins] ) == int:
+                            ls1 = ls.split('.')[0]
+                        else:
+                            ls1 = ls
+
+                        if self.data_dict[ins]['logabundance']:
+                            abundance = 10 ** parameter_values[ 'line-log' + ls1 + self.line_inames[ins] ]
+                        else:
+                            abundance = parameter_values[ 'line-' + ls1 + self.line_inames[ins] ]
+
+                        all_species_abundances[ls] = abundance * np.ones(5)
+
+                    ## Then, add the filling species:
+                    for rs in self.data_dict[ins]['rayleigh_species']:
+                        abundance_ratio = parameter_values[ 'rayleigh-' + rs + self.rayleigh_inames[ins] ]
+                        abundance = abundance_ratio * ( 1 - total_abundance_lines ) / total_abundance_ratio_filling
+                        all_species_abundances[rs] = abundance * np.ones(5)
+
+                    ## Now, calculating the mean molar mass of the atmosphere using the VMR
+                    mean_molar_mass = compute_mean_molar_masses_from_volume_mixing_ratios(all_species_abundances)
+
+                    ## Converting the VMRs to mass fractions using the mean molar mass:
+                    mass_fractions = volume_mixing_ratios2mass_fractions(all_species_abundances, mean_molar_mass)
+
+                    ## Now that we have mass fractions, we can populate the imposed_mass_fractions dict for petitRADTRANS:
+                    for species in all_species_abundances.keys():
+                        if species not in self.data_dict[ins]['rayleigh_species']:
+                            self.models[ins].model_parameters['imposed_mass_fractions'][species] = mass_fractions[species][0]
+                        else:
+                            self.models[ins].model_parameters['filling_species'][species] = mass_fractions[species][0]
+                
                 ## Setting up other planetary parameters
                 ### Calculating and extracting the stellar radius in cm
                 rst = parameter_values['rst']
