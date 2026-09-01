@@ -13,11 +13,11 @@ wav, dep, dep_err = {}, {}, {}
 wav_band, res_func = {}, {}
 for ins in instruments:
     # Spectrum data
-    wav1, dep1, dep_err1 = np.loadtxt(os.getcwd() + f'/Tests/Data/transit_spectrum_isothermal_{ins}_R50.txt', usecols=(0,2,3), unpack=True)
+    wav1, dep1, dep_err1 = np.loadtxt(os.getcwd() + f'/tests/Data/transit_spectrum_isothermal_{ins}_R50.txt', usecols=(0,2,3), unpack=True)
     wav[ins], dep[ins], dep_err[ins] = wav1, dep1, dep_err1
 
     # Instrumental response function data
-    wav_band[ins], res_func[ins] = np.loadtxt(os.getcwd() + f'/Tests/Data/JWST_NIRCam.{ins}.dat', usecols=(0,1), unpack=True)
+    wav_band[ins], res_func[ins] = np.loadtxt(os.getcwd() + f'/tests/Data/JWST_NIRCam.{ins}.dat', usecols=(0,1), unpack=True)
 
 
 # Priors
@@ -28,7 +28,7 @@ hypers = [[-10, -1], [-10, -1], 75, 25, [500, 2000], 0., [-100, 100], 0.01460199
 priors = utils.generate_priors(par, dist, hypers)
 
 # Output directory
-pout = os.getcwd() + '/Tests/Analysis/Analysis_isothermal_R50_resolution/'
+pout = os.getcwd() + '/tests/Analysis/Analysis_isothermal_R50_resolution/'
 
 res = {'F322W2': 300, 'F444W': 200}
 

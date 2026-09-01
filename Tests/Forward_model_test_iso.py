@@ -18,7 +18,7 @@ hypers = [-1, -1, -1, -1, 75, 25, 743, 0.02663, 6.1, 0.001, rst]
 priors = utils.generate_priors(par, dist, hypers)
 
 # Output directory
-pout = os.getcwd() + '/Tests/Analysis/Analysis_isothermal_forward_HD_207496/'
+pout = os.getcwd() + '/tests/Analysis/Analysis_isothermal_forward_HD_207496/'
 
 # Fitting
 data = load(priors=priors, pout=pout, cia=['H2--H2', 'H2--He'], mode='forward-transmission', pressure_range=[-6, 10])
