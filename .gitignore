@@ -220,4 +220,5 @@ __marimo__/
 *DS_Store
 chatak/data
 chatak/tests
-test*
+test*.py
+tests/Analysis
