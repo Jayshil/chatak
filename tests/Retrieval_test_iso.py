@@ -36,3 +36,18 @@ res = {'F322W2': 300, 'F444W': 200}
 data = load(wavelength=wav, depth=dep, depth_err=dep_err, wav_band=wav_band, res_func=res_func,\
             priors=priors, pout=pout, mode='transmission', resolution=res)
 res = data.fit(sampler='dynamic_dynesty', nthreads=14, dynesty_save_states=True, checkpoint_every=10*60)#, dynesty_resume=True)
+
+for i in instruments:
+    model = res.model.evaluate(i)
+
+    ## Plot the model
+    fig, axs = plt.subplots()
+    axs.errorbar(wav[i], dep[i], yerr=dep_err[i], fmt='.', markersize=1., elinewidth=0.7, color='dodgerblue')
+    axs.plot(wav[i], model, color='navy')
+
+    axs.set_xlabel('Wavelength [$\mu$m]')
+    axs.set_ylabel('Transit Depth [ppm]')
+
+    axs.set_ylim([100, 700])
+
+    plt.show()
