@@ -27,8 +27,8 @@ log2pi = np.log(2. * np.pi)  # ln(2*pi)
 
 class load(object):
     def __init__(self, wavelength=None, depth=None, depth_err=None, wav_band=None, res_func=None, priors=None, mode=None,\
-                 pressure_range=[-6, 2], pressure_points=100, cia=[], resolution='c-k', code='petit', petit_vmr=False,\
-                 pout=None, pin=None, verbose=False):
+                 pressure_range=[-6, 2], pressure_points=100, wavelength_range=None, cia=[], resolution='c-k', code='petit',\
+                 petit_vmr=False, pout=None, pin=None, verbose=False):
         # Normal runs save wavelength-space inputs and per-instrument modes.
         # Forward runs only need priors and output location.
         self.wavelength = wavelength
@@ -42,6 +42,10 @@ class load(object):
         self.mode = mode
         self.instruments = []
         self.resolution = resolution
+
+        ## Wavelength range to consider for the modeling. This should be a list or tuple with two elements: [wav_min, wav_max] in microns.
+        ## ONLY used in case of forward models: in case of retrievals, the wavelength range is _ALWAYS_ determined by the data.
+        self.wavelength_range = wavelength_range
 
         ## Pressure range and resolution (in termns of number of points) to create pressure grid to generate models.
         ## Pressure range is in log10(P) where P is in bar. The pressure grid will be created using np.logspace(pressure_range[0], pressure_range[1], pressure_points).
@@ -101,8 +105,12 @@ class load(object):
             self.datadict_preparation()
 
             ## Wavelength ranges for forward runs are not defined by data, so we set them to None. The forward model code will need to handle this appropriately (e.g., by using the full wavelength range of the opacity files or a user-specified range).
-            self.data_dict['FORWARD']['wav_min'] = 0.1
-            self.data_dict['FORWARD']['wav_max'] = 30.
+            if self.wavelength_range is not None:
+                self.data_dict['FORWARD']['wav_min'] = self.wavelength_range[0]
+                self.data_dict['FORWARD']['wav_max'] = self.wavelength_range[1]
+            else:
+                self.data_dict['FORWARD']['wav_min'] = 0.1
+                self.data_dict['FORWARD']['wav_max'] = 30.
 
             # Initialize the models
             self.init_models()
