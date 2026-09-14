@@ -590,6 +590,7 @@ class fit(object):
         self.convolve = convolve
         ### This decides the resolving power of the instrument; only used if convolve is True.
         ### This needs to be a dict, with each key corresponding to an instrument and the value being the resolving power for that instrument.
+        ### Unless, the model is the forward model: in which case, if the user still requires convolution, an integer resolving power can be supplied directly.
         self.resolving_power = resolving_power
 
         self.n_live_points = n_live_points
@@ -631,7 +632,7 @@ class fit(object):
         self.transform_prior = {}
         self.set_prior_transform()
 
-        self.model = model(self.data)
+        self.model = model(self.data, convolve=self.convolve, resolving_power=self.resolving_power)
 
         # First, check if a run has already been performed with the user-defined sampler. If it hasn't, run it.
         # If it has (detected through its output filename), skip running again and jump straight to loading the
@@ -924,7 +925,7 @@ class fit(object):
         return transformed_priors
 
 class model(object):
-    def __init__(self, data):
+    def __init__(self, data, convolve=False, resolving_power=None):
         # The following line will inherit the data and priors from the load instance and set up the forward modeling framework.
         self.data = data
         
@@ -937,8 +938,8 @@ class model(object):
         self.modelOK = True
 
         ## Convolution settings
-        self.convolve = self.data.convolve
-        self.resolving_power = self.data.resolving_power
+        self.convolve = convolve
+        self.resolving_power = resolving_power
 
         ## Instrumental dependence of various parameters
         self.line_inames = {}
@@ -1290,7 +1291,10 @@ class model(object):
 
                 ## Convolution settings for the model
                 if self.convolve:
-                    self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power[ins]
+                    if 'FORWARD' in self.data.mode.keys():
+                        self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power
+                    else:
+                        self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power[ins]
 
                 ## Setting the parameters for temperature profile
                 if self.data_dict[ins]['petitIsoTrans']:
