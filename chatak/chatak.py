@@ -568,7 +568,8 @@ class load(object):
 
 
 class fit(object):
-    def __init__(self, data, sampler='dynesty', n_live_points=500, nthreads=None, dynesty_save_states=False, dynesty_resume=False, **kwargs):
+    def __init__(self, data, sampler='dynesty', n_live_points=500, nthreads=None, dynesty_save_states=False, dynesty_resume=False,\
+                 convolve=False, resolving_power=None, **kwargs):
         # The following line will inherit the data and priors from the load instance and set up the fitting framework.
         self.data = data
 
@@ -576,6 +577,12 @@ class fit(object):
         self.results = None
         self.sampler = sampler
         self.nthreads = nthreads
+
+        ## Set this to true if the user wants to convolve the model with the instrumental response function.
+        self.convolve = convolve
+        ### This decides the resolving power of the instrument; only used if convolve is True.
+        ### This needs to be a dict, with each key corresponding to an instrument and the value being the resolving power for that instrument.
+        self.resolving_power = resolving_power
 
         self.n_live_points = n_live_points
         
@@ -920,6 +927,10 @@ class model(object):
         self.models = self.data.models
 
         self.modelOK = True
+
+        ## Convolution settings
+        self.convolve = self.data.convolve
+        self.resolving_power = self.data.resolving_power
 
         ## Instrumental dependence of various parameters
         self.line_inames = {}
@@ -1269,6 +1280,10 @@ class model(object):
                 ## Reference pressure
                 self.models[ins].model_parameters['reference_pressure'] = parameter_values['refP']
 
+                ## Convolution settings for the model
+                if self.convolve:
+                    self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power[ins]
+
                 ## Setting the parameters for temperature profile
                 if self.data_dict[ins]['petitIsoTrans']:
                     self.models[ins].model_parameters['temperature_profile_mode'] = 'isothermal'
@@ -1277,7 +1292,7 @@ class model(object):
                     if rebin:
                         self.models[ins].model_parameters['rebinned_wavelengths'] = ( self.data.wavelength[ins] * u.micron ).to(u.cm).value
 
-                    forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin)
+                    forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin, convolve=self.convolve)
 
                     forward_wav_model = ( forward_wav_model[0,:] * u.cm ).to(u.micron).value
                     forward_spec_model = ( ( forward_spec_model[0,:] / rst_cm )**2 ) * 1e6
