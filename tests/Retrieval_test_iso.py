@@ -28,13 +28,11 @@ hypers = [[-10, -1], [-10, -1], 75, 25, [500, 2000], 0., [-100, 100], 0.01460199
 priors = utils.generate_priors(par, dist, hypers)
 
 # Output directory
-pout = os.getcwd() + '/tests/Analysis/Analysis_isothermal_R50_resolution/'
-
-res = {'F322W2': 300, 'F444W': 200}
+pout = os.getcwd() + '/tests/Analysis/Analysis_isothermal_R50/'
 
 # Fitting
 data = load(wavelength=wav, depth=dep, depth_err=dep_err, wav_band=wav_band, res_func=res_func,\
-            priors=priors, pout=pout, mode='transmission', resolution=res)
+            priors=priors, pout=pout, mode='transmission')
 res = data.fit(sampler='dynamic_dynesty', nthreads=14, dynesty_save_states=True, checkpoint_every=10*60)#, dynesty_resume=True)
 
 for i in instruments:
