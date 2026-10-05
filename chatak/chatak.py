@@ -433,9 +433,10 @@ class load(object):
             self.data_dict[ self.instruments[i] ]['line_species'] = []
             self.data_dict[ self.instruments[i] ]['logabundance'] = False
 
-            ### Array to save the cloud species which will be used in the modelling.
+            ### Array to save the cloud species/model which will be used in the modelling.
             self.data_dict[ self.instruments[i] ]['cloud_species'] = []
             self.data_dict[ self.instruments[i] ]['logcloud'] = False
+            self.data_dict[ self.instruments[i] ]['gray_cloud'] = False
 
             ### Array to save the rayleigh scattering species which will be used in the modelling.
             self.data_dict[ self.instruments[i] ]['rayleigh_species'] = []
@@ -503,6 +504,13 @@ class load(object):
                             self.data_dict[ self.instruments[i] ]['cloud_species'].append( pri.split('-')[1] )
                             if self.verbose:
                                 print(f"Adding cloud species {pri.split('-')[1]} to instrument {self.instruments[i]}.")
+
+                if pri[0:3].lower() == 'ctp':
+                    ## This means that the prior is for a cloud top pressure.
+                    if ( self.instruments[i] in pri.split('_') ) or ( len(pri.split('_')) == 1 ):
+                        self.data_dict[ self.instruments[i] ]['gray_cloud'] = True
+                        if self.verbose:
+                            print(f"Adding a gray cloud deck for instrument {self.instruments[i]}.")
 
                 if pri[0:8].lower() == 'rayleigh':
                     ## This means that the prior is for a rayleigh scattering species.
@@ -946,6 +954,7 @@ class model(object):
         self.cloud_inames = {}
         self.rayleigh_inames = {}
         self.tp_inames = {}
+        self.ctp_inames = {}
 
         # Define a variable that will save the posterior samples:
         self.posteriors = None
@@ -1005,6 +1014,16 @@ class model(object):
                     else:
                         ## This means that the prior is global (not instrument-dependent).
                         self.tp_inames[ins] = ''
+
+                if pri[0:3].lower() == 'ctp':
+                    vec = pri.split('_')
+                    if len(vec) > 1:
+                        ## This means that the prior is instrument-dependent.
+                        if ins in vec:
+                            self.ctp_inames[ins] = '_' + '_'.join(vec[1:])
+                    else:
+                        ## This means that the prior is global (not instrument-dependent).
+                        self.ctp_inames[ins] = ''
         
         # Set the model-type to M(t):
         self.evaluate = self.evaluate_model
@@ -1295,6 +1314,10 @@ class model(object):
                         self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power
                     else:
                         self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power[ins]
+
+                ## See if the user has provided cloud top pressure
+                if self.data_dict[ins]['gray_cloud']:
+                    self.models[ins].model_parameters['opaque_cloud_top_pressure'] = parameter_values['ctp' + self.ctp_inames[ins]]
 
                 ## Setting the parameters for temperature profile
                 if self.data_dict[ins]['petitIsoTrans']:
