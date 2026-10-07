@@ -1342,6 +1342,22 @@ class model(object):
                 if self.data_dict[ins]['haze']:
                     self.models[ins].model_parameters['haze_factor'] = parameter_values['hazefac' + self.haze_inames[ins]]
 
+                ## Let's check the sum of the abundances of all species (it should ideally be 1)
+                ## In case there are filling species, we do not calculate the absolute abundances of the filling species, but rather, their ratio.
+                ## So in that case, we need to check that the sum of the non-filling species' abundances is less than or equal to 1
+                if len(self.data_dict[ins]['rayleigh_species']) == 0:
+                    ## That means there no filling species, so the sum of all species' abundances should ideally be 1
+                    total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
+                    if not np.isclose(total_abundance, 1.0):
+                        print(f"Total abundance of all species should ideally be 1, but got {total_abundance}")
+                        self.modelOK = False
+                else:
+                    ## There are filling species, so the sum of the non-filling species' abundances should be less than or equal to 1
+                    total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
+                    if total_abundance > 1.0:
+                        print(f"Total abundance of non-filling species should be less than or equal to 1, but got {total_abundance}")
+                        self.modelOK = False
+
                 ## Setting the parameters for temperature profile
                 if self.data_dict[ins]['petitIsoTrans']:
                     self.models[ins].model_parameters['temperature_profile_mode'] = 'isothermal'
@@ -1350,7 +1366,12 @@ class model(object):
                     if rebin:
                         self.models[ins].model_parameters['rebinned_wavelengths'] = ( self.data.wavelength[ins] * u.micron ).to(u.cm).value
 
-                    forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin, convolve=self.convolve)
+                    if self.modelOK:
+                        forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin, convolve=self.convolve)
+                        forward_wav_model = ( forward_wav_model[0,:] * u.cm ).to(u.micron).value
+                        forward_spec_model = ( ( forward_spec_model[0,:] / rst_cm )**2 ) * 1e6
+                    else:
+                        forward_wav_model, forward_spec_model = np.copy(self.data.wavelength[ins]), np.ones(len(self.data.wavelength[ins]))
 
                     forward_wav_model = ( forward_wav_model[0,:] * u.cm ).to(u.micron).value
                     forward_spec_model = ( ( forward_spec_model[0,:] / rst_cm )**2 ) * 1e6
