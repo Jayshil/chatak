@@ -437,6 +437,7 @@ class load(object):
             self.data_dict[ self.instruments[i] ]['cloud_species'] = []
             self.data_dict[ self.instruments[i] ]['logcloud'] = False
             self.data_dict[ self.instruments[i] ]['gray_cloud'] = False
+            self.data_dict[ self.instruments[i] ]['haze'] = False
 
             ### Array to save the rayleigh scattering species which will be used in the modelling.
             self.data_dict[ self.instruments[i] ]['rayleigh_species'] = []
@@ -511,6 +512,13 @@ class load(object):
                         self.data_dict[ self.instruments[i] ]['gray_cloud'] = True
                         if self.verbose:
                             print(f"Adding a gray cloud deck for instrument {self.instruments[i]}.")
+
+                if pri[0:7].lower() == 'hazefac':
+                    ## This means that the prior is for a haze factor (scaled Rayleight scattering).
+                    if ( self.instruments[i] in pri.split('_') ) or ( len(pri.split('_')) == 1 ):
+                        self.data_dict[ self.instruments[i] ]['haze'] = True
+                        if self.verbose:
+                            print(f"Adding a haze factor for instrument {self.instruments[i]}.")
 
                 if pri[0:8].lower() == 'rayleigh':
                     ## This means that the prior is for a rayleigh scattering species.
@@ -955,6 +963,7 @@ class model(object):
         self.rayleigh_inames = {}
         self.tp_inames = {}
         self.ctp_inames = {}
+        self.haze_inames = {}
 
         # Define a variable that will save the posterior samples:
         self.posteriors = None
@@ -1014,6 +1023,16 @@ class model(object):
                     else:
                         ## This means that the prior is global (not instrument-dependent).
                         self.tp_inames[ins] = ''
+                
+                if pri[0:7].lower() == 'hazefac':
+                    vec = pri.split('_')
+                    if len(vec) > 1:
+                        ## This means that the prior is instrument-dependent.
+                        if ins in vec:
+                            self.haze_inames[ins] = '_' + '_'.join(vec[1:])
+                    else:
+                        ## This means that the prior is global (not instrument-dependent).
+                        self.haze_inames[ins] = ''
 
                 if pri[0:3].lower() == 'ctp':
                     vec = pri.split('_')
@@ -1318,6 +1337,10 @@ class model(object):
                 ## See if the user has provided cloud top pressure
                 if self.data_dict[ins]['gray_cloud']:
                     self.models[ins].model_parameters['opaque_cloud_top_pressure'] = parameter_values['ctp' + self.ctp_inames[ins]]
+
+                ## Setting the parameters for haze factor
+                if self.data_dict[ins]['haze']:
+                    self.models[ins].model_parameters['haze_factor'] = parameter_values['hazefac' + self.haze_inames[ins]]
 
                 ## Setting the parameters for temperature profile
                 if self.data_dict[ins]['petitIsoTrans']:
