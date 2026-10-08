@@ -577,9 +577,9 @@ class load(object):
             if len(set(cloud_sets)) > 1:
                 print('Warning: cloud species are different across instruments.')
 
-            rayleigh_sets = [tuple(sorted(set(self.data_dict[ins]['rayleigh_species']))) for ins in self.instruments]
-            if len(set(rayleigh_sets)) > 1:
-                print('Warning: Rayleigh scattering species (and continuum opacities) are different across instruments.')
+            filling_sets = [tuple(sorted(set(self.data_dict[ins]['filling_species']))) for ins in self.instruments]
+            if len(set(filling_sets)) > 1:
+                print('Warning: Filling species are different across instruments.')
 
     def init_models(self):
         self.models = {}
@@ -1256,6 +1256,8 @@ class model(object):
         ## Okay now we want to generate the forward model for each instrument using the parameter values.
         ## The parameter values will be a dictionary with parameter names as keys and their corresponding values as values.
         ## We will loop through the instruments and generate the model spectrum for each instrument using the SpectralModel class from petitRADTRANS (or the appropriate class for the chosen forward model code).
+
+        self.modelOK = True
         
         for ins in self.instruments:
             if self.data.code == 'petit':
