@@ -1375,8 +1375,7 @@ class model(object):
             if not self.data.petit_vmr:
                 ## If petit_vmr is False, then we assume that the user has provided mass fractions directly.
                 self.models[ins].model_parameters['imposed_mass_fractions'][ls] = abundance
-            else:
-                total_abundance_lines += abundance
+            total_abundance_lines += abundance
         
         ## List of filling species
         self.models[ins].model_parameters['filling_species'] = {}
@@ -1387,8 +1386,12 @@ class model(object):
             if not self.data.petit_vmr:
                 ## If petit_vmr is False, then we assume that the user has provided mass fractions directly.
                 self.models[ins].model_parameters['filling_species'][fs] = self.data_dict[ins]['filling_species_weights'][fs]
-            else:
-                total_abundance_ratio_filling += self.data_dict[ins]['filling_species_weights'][fs]
+            total_abundance_ratio_filling += self.data_dict[ins]['filling_species_weights'][fs]
+
+        ## We need to impose mass fractions for all line species (i.e., even the ones which are filling species)
+        ## Math is below
+        for lfs in self.data_dict[ins]['filling_line_species']:
+            self.models[ins].model_parameters['imposed_mass_fractions'][lfs] = self.data_dict[ins]['filling_species_weights'][lfs] * ( 1 - total_abundance_lines ) / total_abundance_ratio_filling
 
         ## Okay, now if petit_vmr is True, then the user has provided the abundances in the volume mixing ratio.
         ## So, we need to convert them back to the mass fractions for petitRADTRANS.
@@ -1436,6 +1439,10 @@ class model(object):
                     self.models[ins].model_parameters['imposed_mass_fractions'][species] = mass_fractions[species][0]
                 else:
                     self.models[ins].model_parameters['filling_species'][species] = mass_fractions[species][0]
+
+            ## This is not enough; we also need to impose mass fractions for the filling line species.
+            for lfs in self.data_dict[ins]['filling_line_species']:
+                self.models[ins].model_parameters['imposed_mass_fractions'][lfs] = mass_fractions[lfs][0]
 
     def gaussian_log_likelihood(self, residuals, variances):
         taus = 1. / variances
