@@ -1,0 +1,8 @@
+# parameter   distribution hyperparameters
+line-logCO2 fixed        np.float64(-3.0)
+line-logCH4 fixed        np.float64(-4.0)
+isotemp     fixed        1375
+rprs        fixed        0.0146
+mp          fixed        3.55
+refP        fixed        0.001
+rst         fixed        1.258
