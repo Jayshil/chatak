@@ -221,4 +221,5 @@ __marimo__/
 chatak/data
 chatak/tests
 test*.py
+test*.ipynb
 tests/Analysis

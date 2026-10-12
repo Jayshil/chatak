@@ -27,8 +27,8 @@ log2pi = np.log(2. * np.pi)  # ln(2*pi)
 
 class load(object):
     def __init__(self, wavelength=None, depth=None, depth_err=None, wav_band=None, res_func=None, priors=None, mode=None,\
-                 pressure_range=[-6, 2], pressure_points=100, cia=[], resolution='c-k', code='petit', petit_vmr=False,\
-                 pout=None, pin=None, verbose=False):
+                 pressure_range=[-6, 2], pressure_points=100, wavelength_range=None, filling_species={}, filling_line=[],\
+                 cia=[], rayleigh_species=[], resolution='c-k', code='petit', petit_vmr=False, pout=None, pin=None, verbose=False):
         # Normal runs save wavelength-space inputs and per-instrument modes.
         # Forward runs only need priors and output location.
         self.wavelength = wavelength
@@ -42,6 +42,13 @@ class load(object):
         self.mode = mode
         self.instruments = []
         self.resolution = resolution
+
+        if self.pout[-1] != '/':
+            self.pout = self.pout + '/'
+
+        ## Wavelength range to consider for the modeling. This should be a list or tuple with two elements: [wav_min, wav_max] in microns.
+        ## ONLY used in case of forward models: in case of retrievals, the wavelength range is _ALWAYS_ determined by the data.
+        self.wavelength_range = wavelength_range
 
         ## Pressure range and resolution (in termns of number of points) to create pressure grid to generate models.
         ## Pressure range is in log10(P) where P is in bar. The pressure grid will be created using np.logspace(pressure_range[0], pressure_range[1], pressure_points).
@@ -57,6 +64,19 @@ class load(object):
         # This should be a list of strings corresponding to the CIA species available in the opacity files (e.g., 'H2--H2', 'H2--He').
         # I think this is only used for petitRADTRANS, but we can keep it as a general input for now.
         self.cia = cia
+
+        # Rayleigh scattering species to include in the modeling.
+        # This should be a list of strings corresponding to the Rayleigh scattering species available in the opacity files (e.g., 'H2', 'He').
+        # I think this is only used for petitRADTRANS, but we can keep it as a general input for now.
+        self.rayleigh_species = rayleigh_species
+
+        # Filling species to include in the modeling.
+        # This should be a dictionary where the keys are the species names and the values are their corresponding weights.
+        self.filling_species = filling_species
+
+        # Whether a given filling species should be included as a line species in the modeling.
+        # This should be a list of strings corresponding to the filling species that should be treated as line species.
+        self.filling_line = filling_line
 
         # The code to generate forward models; currently only petitRADTRANS is supported.
         # Use petit for petitRADTRANS and poseidon for POSEIDON (POSEIDON support is planned but not yet implemented).
@@ -101,8 +121,12 @@ class load(object):
             self.datadict_preparation()
 
             ## Wavelength ranges for forward runs are not defined by data, so we set them to None. The forward model code will need to handle this appropriately (e.g., by using the full wavelength range of the opacity files or a user-specified range).
-            self.data_dict['FORWARD']['wav_min'] = 0.1
-            self.data_dict['FORWARD']['wav_max'] = 30.
+            if self.wavelength_range is not None:
+                self.data_dict['FORWARD']['wav_min'] = self.wavelength_range[0]
+                self.data_dict['FORWARD']['wav_max'] = self.wavelength_range[1]
+            else:
+                self.data_dict['FORWARD']['wav_min'] = 0.1
+                self.data_dict['FORWARD']['wav_max'] = 30.
 
             # Initialize the models
             self.init_models()
@@ -425,12 +449,21 @@ class load(object):
             self.data_dict[ self.instruments[i] ]['line_species'] = []
             self.data_dict[ self.instruments[i] ]['logabundance'] = False
 
-            ### Array to save the cloud species which will be used in the modelling.
+            ### Array to save the filling species which will be used in the modelling.
+            self.data_dict[ self.instruments[i] ]['filling_species'] = []
+            self.data_dict[ self.instruments[i] ]['filling_species_weights'] = {}
+            self.data_dict[ self.instruments[i] ]['filling_line_species'] = []      ## For filling species that will also contribute to the lines.
+
+            ### Array to save the cloud species/model which will be used in the modelling.
             self.data_dict[ self.instruments[i] ]['cloud_species'] = []
             self.data_dict[ self.instruments[i] ]['logcloud'] = False
+            self.data_dict[ self.instruments[i] ]['gray_cloud'] = False
+            self.data_dict[ self.instruments[i] ]['haze'] = False
 
             ### Array to save the rayleigh scattering species which will be used in the modelling.
-            self.data_dict[ self.instruments[i] ]['rayleigh_species'] = []
+            ### No longer needed: rayleigh scattering species will be provided directly in chatak.load, and we don't need to set priors for them.
+            ### So, I am commenting out the rayleigh_species section.
+            #self.data_dict[ self.instruments[i] ]['rayleigh_species'] = []
 
         # Let's see if the user wants to fit either for the planetary mass or the surface gravity.
         self.data_dict['mass_fit'] = False
@@ -457,6 +490,11 @@ class load(object):
                 elif self.resolution[self.instruments[i]] == 'lbl':
                     self.data_dict[ self.instruments[i] ]['opacity_mode'] = 'lbl'
 
+            ### For filling species
+            for fs in self.filling_species.keys():
+                if ( self.instruments[i] in fs.split('_') ) or ( len(fs.split('_')) == 1 ):
+                    self.data_dict[ self.instruments[i] ]['filling_species'].append(fs + resolution)
+                    self.data_dict[ self.instruments[i] ]['filling_species_weights'][fs + resolution] = self.filling_species[fs]
             
             for pri in self.priors.keys():
                 
@@ -496,12 +534,37 @@ class load(object):
                             if self.verbose:
                                 print(f"Adding cloud species {pri.split('-')[1]} to instrument {self.instruments[i]}.")
 
-                if pri[0:8].lower() == 'rayleigh':
-                    ## This means that the prior is for a rayleigh scattering species.
+                if pri[0:3].lower() == 'ctp':
+                    ## This means that the prior is for a cloud top pressure.
                     if ( self.instruments[i] in pri.split('_') ) or ( len(pri.split('_')) == 1 ):
-                        self.data_dict[ self.instruments[i] ]['rayleigh_species'].append( pri.split('-')[1] )
+                        self.data_dict[ self.instruments[i] ]['gray_cloud'] = True
                         if self.verbose:
-                            print(f"Adding Rayleigh scattering species {pri.split('-')[1]} to instrument {self.instruments[i]}.")
+                            print(f"Adding a gray cloud deck for instrument {self.instruments[i]}.")
+
+                if pri[0:7].lower() == 'hazefac':
+                    ## This means that the prior is for a haze factor (scaled Rayleight scattering).
+                    if ( self.instruments[i] in pri.split('_') ) or ( len(pri.split('_')) == 1 ):
+                        self.data_dict[ self.instruments[i] ]['haze'] = True
+                        if self.verbose:
+                            print(f"Adding a haze factor for instrument {self.instruments[i]}.")
+
+                # Why did I comment this? Well, turns out that we don't need to provide priors for Rayleigh scattering species.
+                # So, I am commenting out the section that handles Rayleigh scattering species.
+                #if pri[0:8].lower() == 'rayleigh':
+                #    ## This means that the prior is for a rayleigh scattering species.
+                #    if ( self.instruments[i] in pri.split('_') ) or ( len(pri.split('_')) == 1 ):
+                #        self.data_dict[ self.instruments[i] ]['rayleigh_species'].append( pri.split('-')[1] )
+                #        if self.verbose:
+                #            print(f"Adding Rayleigh scattering species {pri.split('-')[1]} to instrument {self.instruments[i]}.")
+
+
+            ## Add species to the line_species if self.filling_line is not empty.
+            ## This means that there are some filling species that should also be treated as line species.
+            if len(self.filling_line) > 0:
+                for species in self.filling_line:
+                    if ( self.instruments[i] in species.split('_') ) or ( len(species.split('_')) == 1 ):
+                        self.data_dict[ self.instruments[i] ]['line_species'].append(species + resolution)
+                        self.data_dict[ self.instruments[i] ]['filling_line_species'].append(species + resolution)
 
         # Warn (without breaking execution) if setups differ across instruments.
         if len(self.instruments) > 1:
@@ -517,9 +580,9 @@ class load(object):
             if len(set(cloud_sets)) > 1:
                 print('Warning: cloud species are different across instruments.')
 
-            rayleigh_sets = [tuple(sorted(set(self.data_dict[ins]['rayleigh_species']))) for ins in self.instruments]
-            if len(set(rayleigh_sets)) > 1:
-                print('Warning: Rayleigh scattering species (and continuum opacities) are different across instruments.')
+            filling_sets = [tuple(sorted(set(self.data_dict[ins]['filling_species']))) for ins in self.instruments]
+            if len(set(filling_sets)) > 1:
+                print('Warning: Filling species are different across instruments.')
 
     def init_models(self):
         self.models = {}
@@ -528,7 +591,7 @@ class load(object):
                 self.models[ self.instruments[i] ] = SpectralModel(
                                                                    pressures=np.logspace(self.pressure_range[0], self.pressure_range[1], self.pressure_points),
                                                                    line_species=self.data_dict[ self.instruments[i] ]['line_species'],
-                                                                   rayleigh_species=self.data_dict[ self.instruments[i] ]['rayleigh_species'],
+                                                                   rayleigh_species=self.rayleigh_species,
                                                                    gas_continuum_contributors=self.cia,
                                                                    wavelength_boundaries=[self.data_dict[ self.instruments[i] ]['wav_min'], self.data_dict[ self.instruments[i] ]['wav_max']],
                                                                    line_opacity_mode=self.data_dict[ self.instruments[i] ]['opacity_mode']
@@ -568,7 +631,8 @@ class load(object):
 
 
 class fit(object):
-    def __init__(self, data, sampler='dynesty', n_live_points=500, nthreads=None, dynesty_save_states=False, dynesty_resume=False, **kwargs):
+    def __init__(self, data, sampler='dynesty', n_live_points=500, nthreads=None, dynesty_save_states=False, dynesty_resume=False,\
+                 convolve=False, resolving_power=None, **kwargs):
         # The following line will inherit the data and priors from the load instance and set up the fitting framework.
         self.data = data
 
@@ -576,6 +640,13 @@ class fit(object):
         self.results = None
         self.sampler = sampler
         self.nthreads = nthreads
+
+        ## Set this to true if the user wants to convolve the model with the instrumental response function.
+        self.convolve = convolve
+        ### This decides the resolving power of the instrument; only used if convolve is True.
+        ### This needs to be a dict, with each key corresponding to an instrument and the value being the resolving power for that instrument.
+        ### Unless, the model is the forward model: in which case, if the user still requires convolution, an integer resolving power can be supplied directly.
+        self.resolving_power = resolving_power
 
         self.n_live_points = n_live_points
         
@@ -616,7 +687,7 @@ class fit(object):
         self.transform_prior = {}
         self.set_prior_transform()
 
-        self.model = model(self.data)
+        self.model = model(self.data, convolve=self.convolve, resolving_power=self.resolving_power)
 
         # First, check if a run has already been performed with the user-defined sampler. If it hasn't, run it.
         # If it has (detected through its output filename), skip running again and jump straight to loading the
@@ -909,7 +980,7 @@ class fit(object):
         return transformed_priors
 
 class model(object):
-    def __init__(self, data):
+    def __init__(self, data, convolve=False, resolving_power=None):
         # The following line will inherit the data and priors from the load instance and set up the forward modeling framework.
         self.data = data
         
@@ -921,11 +992,17 @@ class model(object):
 
         self.modelOK = True
 
+        ## Convolution settings
+        self.convolve = convolve
+        self.resolving_power = resolving_power
+
         ## Instrumental dependence of various parameters
         self.line_inames = {}
         self.cloud_inames = {}
-        self.rayleigh_inames = {}
+        #self.rayleigh_inames = {}        ### Commenting this out, because we are providing Rayleigh species differently.
         self.tp_inames = {}
+        self.ctp_inames = {}
+        self.haze_inames = {}
 
         # Define a variable that will save the posterior samples:
         self.posteriors = None
@@ -966,15 +1043,16 @@ class model(object):
                         ## This means that the prior is global (not instrument-dependent).
                         self.cloud_inames[ins] = ''
 
-                if pri[0:8].lower() == 'rayleigh':
-                    vec = pri.split('_')
-                    if len(vec) > 1:
-                        ## This means that the prior is instrument-dependent.
-                        if ins in vec:
-                            self.rayleigh_inames[ins] = '_' + '_'.join(vec[1:])
-                    else:
-                        ## This means that the prior is global (not instrument-dependent).
-                        self.rayleigh_inames[ins] = ''
+                ### No longer needed as Rayleigh species are now provided differently.
+                #if pri[0:8].lower() == 'rayleigh':
+                #    vec = pri.split('_')
+                #    if len(vec) > 1:
+                #        ## This means that the prior is instrument-dependent.
+                #        if ins in vec:
+                #            self.rayleigh_inames[ins] = '_' + '_'.join(vec[1:])
+                #    else:
+                #        ## This means that the prior is global (not instrument-dependent).
+                #        self.rayleigh_inames[ins] = ''
 
                 if pri[0:7].lower() == 'isotemp':
                     vec = pri.split('_')
@@ -985,6 +1063,26 @@ class model(object):
                     else:
                         ## This means that the prior is global (not instrument-dependent).
                         self.tp_inames[ins] = ''
+                
+                if pri[0:7].lower() == 'hazefac':
+                    vec = pri.split('_')
+                    if len(vec) > 1:
+                        ## This means that the prior is instrument-dependent.
+                        if ins in vec:
+                            self.haze_inames[ins] = '_' + '_'.join(vec[1:])
+                    else:
+                        ## This means that the prior is global (not instrument-dependent).
+                        self.haze_inames[ins] = ''
+
+                if pri[0:3].lower() == 'ctp':
+                    vec = pri.split('_')
+                    if len(vec) > 1:
+                        ## This means that the prior is instrument-dependent.
+                        if ins in vec:
+                            self.ctp_inames[ins] = '_' + '_'.join(vec[1:])
+                    else:
+                        ## This means that the prior is global (not instrument-dependent).
+                        self.ctp_inames[ins] = ''
         
         # Set the model-type to M(t):
         self.evaluate = self.evaluate_model
@@ -1161,92 +1259,14 @@ class model(object):
         ## Okay now we want to generate the forward model for each instrument using the parameter values.
         ## The parameter values will be a dictionary with parameter names as keys and their corresponding values as values.
         ## We will loop through the instruments and generate the model spectrum for each instrument using the SpectralModel class from petitRADTRANS (or the appropriate class for the chosen forward model code).
+
+        self.modelOK = True
         
         for ins in self.instruments:
             if self.data.code == 'petit':
                 # Alright, we will generate the forward model using petitRADTRANS for this instrument.
-                # We also don't know if the input parameters are in log space or not.
 
-                ## List of line species for this instrument.
-                self.models[ins].model_parameters['imposed_mass_fractions'] = {}
-
-                ### Saving the total abundaces of the line species
-                total_abundance_lines = 0.0
-                for ls in self.data_dict[ins]['line_species']:
-
-                    ## If the resolution is int, then the name of the species would be something like 'CO2.R200'. 
-                    ## Let's leave resolution out of the name of the species (used in case if petit_vmr is True).
-                    if type( self.data.resolution[ins] ) == int:
-                        ls1 = ls.split('.')[0]
-                    else:
-                        ls1 = ls
-
-                    if self.data_dict[ins]['logabundance']:
-                        abundance = 10 ** parameter_values[ 'line-log' + ls1 + self.line_inames[ins] ]
-                    else:
-                        abundance = parameter_values[ 'line-' + ls1 + self.line_inames[ins] ]
-                    
-                    if not self.data.petit_vmr:
-                        ## If petit_vmr is False, then we assume that the user has provided mass fractions directly.
-                        self.models[ins].model_parameters['imposed_mass_fractions'][ls] = abundance
-                    else:
-                        total_abundance_lines += abundance
-                
-                ## List of filling species
-                self.models[ins].model_parameters['filling_species'] = {}
-
-                ### Total ratios of filling species to line species (used in case if petit_vmr is True)
-                total_abundance_ratio_filling = 0.0
-                for rs in self.data_dict[ins]['rayleigh_species']:
-                    if not self.data.petit_vmr:
-                        ## If petit_vmr is False, then we assume that the user has provided mass fractions directly.
-                        self.models[ins].model_parameters['filling_species'][rs] = parameter_values[ 'rayleigh-' + rs + self.rayleigh_inames[ins] ]
-                    else:
-                        total_abundance_ratio_filling += parameter_values[ 'rayleigh-' + rs + self.rayleigh_inames[ins] ]
-
-                ## Okay, now if petit_vmr is True, then the user has provided the abundances in the volume mixing ratio.
-                ## So, we need to convert them back to the mass fractions for petitRADTRANS.
-                ## First, we need to generate a dict containing abundances of all species (line and filling).
-                ## We have the abundances of the line species, but not of the filling species (because we only ask for the ratios of the filling species)
-                ## So, let's first calculate the total abundances of the filling species.
-                ## Some math on how I do this: l1 + l2 + ... + ln + f1 + f2 + ... + fm = 1 (where l are line species and f are filling species); we know l1, l2, ..., ln; we also know f1:f2:...:fm; so, we can calculate f1, f2, ..., fm using the ratios and the total abundance of the line species.
-                ## let's say, f1:f2:...:fm = r1:r2:...:rm; then, f1 = r1 * ( 1 - total_abundance_lines ) / ( r1 + r2 + ... + rm ); f2 = r2 * ( 1 - total_abundance_lines ) / ( r1 + r2 + ... + rm ); ...; fm = rm * ( 1 - total_abundance_lines ) / ( r1 + r2 + ... + rm )
-                ## r1 + r2 + ... + rm is total_abundance_ratio_filling
-                if self.data.petit_vmr:
-                    ## Creating a dict to save the abundances of all species.
-                    all_species_abundances = {}
-                    ## First, add the line species:
-                    for ls in self.data_dict[ins]['line_species']:
-                        if type( self.data.resolution[ins] ) == int:
-                            ls1 = ls.split('.')[0]
-                        else:
-                            ls1 = ls
-
-                        if self.data_dict[ins]['logabundance']:
-                            abundance = 10 ** parameter_values[ 'line-log' + ls1 + self.line_inames[ins] ]
-                        else:
-                            abundance = parameter_values[ 'line-' + ls1 + self.line_inames[ins] ]
-
-                        all_species_abundances[ls] = abundance * np.ones(5)
-
-                    ## Then, add the filling species:
-                    for rs in self.data_dict[ins]['rayleigh_species']:
-                        abundance_ratio = parameter_values[ 'rayleigh-' + rs + self.rayleigh_inames[ins] ]
-                        abundance = abundance_ratio * ( 1 - total_abundance_lines ) / total_abundance_ratio_filling
-                        all_species_abundances[rs] = abundance * np.ones(5)
-
-                    ## Now, calculating the mean molar mass of the atmosphere using the VMR
-                    mean_molar_mass = compute_mean_molar_masses_from_volume_mixing_ratios(all_species_abundances)
-
-                    ## Converting the VMRs to mass fractions using the mean molar mass:
-                    mass_fractions = volume_mixing_ratios2mass_fractions(all_species_abundances, mean_molar_mass)
-
-                    ## Now that we have mass fractions, we can populate the imposed_mass_fractions dict for petitRADTRANS:
-                    for species in all_species_abundances.keys():
-                        if species not in self.data_dict[ins]['rayleigh_species']:
-                            self.models[ins].model_parameters['imposed_mass_fractions'][species] = mass_fractions[species][0]
-                        else:
-                            self.models[ins].model_parameters['filling_species'][species] = mass_fractions[species][0]
+                self.set_abundances(ins=ins, parameter_values=parameter_values)
                 
                 ## Setting up other planetary parameters
                 ### Calculating and extracting the stellar radius in cm
@@ -1269,6 +1289,37 @@ class model(object):
                 ## Reference pressure
                 self.models[ins].model_parameters['reference_pressure'] = parameter_values['refP']
 
+                ## Convolution settings for the model
+                if self.convolve:
+                    if 'FORWARD' in self.data.mode.keys():
+                        self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power
+                    else:
+                        self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power[ins]
+
+                ## See if the user has provided cloud top pressure
+                if self.data_dict[ins]['gray_cloud']:
+                    self.models[ins].model_parameters['opaque_cloud_top_pressure'] = parameter_values['ctp' + self.ctp_inames[ins]]
+
+                ## Setting the parameters for haze factor
+                if self.data_dict[ins]['haze']:
+                    self.models[ins].model_parameters['haze_factor'] = parameter_values['hazefac' + self.haze_inames[ins]]
+
+                ## Let's check the sum of the abundances of all species (it should ideally be 1)
+                ## In case there are filling species, we do not calculate the absolute abundances of the filling species, but rather, their ratio.
+                ## So in that case, we need to check that the sum of the non-filling species' abundances is less than or equal to 1
+                if len(self.data_dict[ins]['filling_species']) == 0:
+                    ## That means there no filling species, so the sum of all species' abundances should ideally be 1
+                    total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
+                    if not np.isclose(total_abundance, 1.0):
+                        print(f"Total abundance of all species should ideally be 1, but got {total_abundance}")
+                        self.modelOK = False
+                else:
+                    ## There are filling species, so the sum of the non-filling species' abundances should be less than or equal to 1
+                    total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
+                    if total_abundance > 1.0:
+                        print(f"Total abundance of non-filling species should be less than or equal to 1, but got {total_abundance}")
+                        self.modelOK = False
+
                 ## Setting the parameters for temperature profile
                 if self.data_dict[ins]['petitIsoTrans']:
                     self.models[ins].model_parameters['temperature_profile_mode'] = 'isothermal'
@@ -1277,10 +1328,12 @@ class model(object):
                     if rebin:
                         self.models[ins].model_parameters['rebinned_wavelengths'] = ( self.data.wavelength[ins] * u.micron ).to(u.cm).value
 
-                    forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin)
-
-                    forward_wav_model = ( forward_wav_model[0,:] * u.cm ).to(u.micron).value
-                    forward_spec_model = ( ( forward_spec_model[0,:] / rst_cm )**2 ) * 1e6
+                    if self.modelOK:
+                        forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin, convolve=self.convolve)
+                        forward_wav_model = ( forward_wav_model[0,:] * u.cm ).to(u.micron).value
+                        forward_spec_model = ( ( forward_spec_model[0,:] / rst_cm )**2 ) * 1e6
+                    else:
+                        forward_wav_model, forward_spec_model = np.copy(self.data.wavelength[ins]), np.ones(len(self.data.wavelength[ins]))
 
                 # We don't need offset and sigma_w for forward models
                 if 'FORWARD' in self.data.mode.keys():
@@ -1295,7 +1348,104 @@ class model(object):
 
             else:
                 raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.data.code}")
+
+
+    def set_abundances(self, ins, parameter_values):
+        ## List of line species for this instrument.
+        self.models[ins].model_parameters['imposed_mass_fractions'] = {}
+
+        ### Saving the total abundaces of the line species (needed for petit_vmr calculations)
+        total_abundance_lines = 0.0
+        for ls in self.data_dict[ins]['line_species']:
+            if ls in self.data_dict[ins]['filling_line_species']:
+                ## Skip filling species which have contributions to lines when setting abundances for line species.
+                ## These are the species that will fill the remaining abundance, _and_ it will also contribute to the lines.
+                ## However, they are filling species, so they will not have priors. So, we need to skip them in this loop.
+                continue
+
+            ## If the resolution is int, then the name of the species would be something like 'CO2.R200'. 
+            ## Let's leave resolution out of the name of the species (used in case if petit_vmr is True).
+            if type( self.data.resolution[ins] ) == int:
+                ls1 = ls.split('.')[0]
+            else:
+                ls1 = ls
+
+            if self.data_dict[ins]['logabundance']:
+                abundance = 10 ** parameter_values[ 'line-log' + ls1 + self.line_inames[ins] ]
+            else:
+                abundance = parameter_values[ 'line-' + ls1 + self.line_inames[ins] ]
             
+            if not self.data.petit_vmr:
+                ## If petit_vmr is False, then we assume that the user has provided mass fractions directly.
+                self.models[ins].model_parameters['imposed_mass_fractions'][ls] = abundance
+            total_abundance_lines += abundance
+        
+        ## List of filling species
+        self.models[ins].model_parameters['filling_species'] = {}
+
+        ### Total ratios of filling species to line species (used in case if petit_vmr is True)
+        total_abundance_ratio_filling = 0.0
+        for fs in self.data_dict[ins]['filling_species']:
+            if not self.data.petit_vmr:
+                ## If petit_vmr is False, then we assume that the user has provided mass fractions directly.
+                self.models[ins].model_parameters['filling_species'][fs] = self.data_dict[ins]['filling_species_weights'][fs]
+            total_abundance_ratio_filling += self.data_dict[ins]['filling_species_weights'][fs]
+
+        ## We need to impose mass fractions for all line species (i.e., even the ones which are filling species)
+        ## Math is below
+        for lfs in self.data_dict[ins]['filling_line_species']:
+            self.models[ins].model_parameters['imposed_mass_fractions'][lfs] = self.data_dict[ins]['filling_species_weights'][lfs] * ( 1 - total_abundance_lines ) / total_abundance_ratio_filling
+
+        ## Okay, now if petit_vmr is True, then the user has provided the abundances in the volume mixing ratio.
+        ## So, we need to convert them back to the mass fractions for petitRADTRANS.
+        ## First, we need to generate a dict containing abundances of all species (line and filling).
+        ## We have the abundances of the line species, but not of the filling species (because we only ask for the ratios of the filling species)
+        ## So, let's first calculate the total abundances of the filling species.
+        ## Some math on how I do this: l1 + l2 + ... + ln + f1 + f2 + ... + fm = 1 (where l are line species and f are filling species); we know l1, l2, ..., ln; we also know f1:f2:...:fm; so, we can calculate f1, f2, ..., fm using the ratios and the total abundance of the line species.
+        ## let's say, f1:f2:...:fm = r1:r2:...:rm; then, f1 = r1 * ( 1 - total_abundance_lines ) / ( r1 + r2 + ... + rm ); f2 = r2 * ( 1 - total_abundance_lines ) / ( r1 + r2 + ... + rm ); ...; fm = rm * ( 1 - total_abundance_lines ) / ( r1 + r2 + ... + rm )
+        ## r1 + r2 + ... + rm is total_abundance_ratio_filling
+        if self.data.petit_vmr:
+            ## Creating a dict to save the abundances of all species.
+            all_species_abundances = {}
+            ## First, add the line species:
+            for ls in self.data_dict[ins]['line_species']:
+                if type( self.data.resolution[ins] ) == int:
+                    ls1 = ls.split('.')[0]
+                else:
+                    ls1 = ls
+
+                if ls in self.data_dict[ins]['filling_line_species']:
+                    continue
+
+                if self.data_dict[ins]['logabundance']:
+                    abundance = 10 ** parameter_values[ 'line-log' + ls1 + self.line_inames[ins] ]
+                else:
+                    abundance = parameter_values[ 'line-' + ls1 + self.line_inames[ins] ]
+
+                all_species_abundances[ls] = abundance * np.ones(5)
+
+            ## Then, add the filling species:
+            for fs in self.data_dict[ins]['filling_species']:
+                abundance_ratio = self.data_dict[ins]['filling_species_weights'][fs]
+                abundance = abundance_ratio * ( 1 - total_abundance_lines ) / total_abundance_ratio_filling
+                all_species_abundances[fs] = abundance * np.ones(5)
+
+            ## Now, calculating the mean molar mass of the atmosphere using the VMR
+            mean_molar_mass = compute_mean_molar_masses_from_volume_mixing_ratios(all_species_abundances)
+
+            ## Converting the VMRs to mass fractions using the mean molar mass:
+            mass_fractions = volume_mixing_ratios2mass_fractions(all_species_abundances, mean_molar_mass)
+
+            ## Now that we have mass fractions, we can populate the imposed_mass_fractions dict for petitRADTRANS:
+            for species in all_species_abundances.keys():
+                if species not in self.data_dict[ins]['filling_species']:
+                    self.models[ins].model_parameters['imposed_mass_fractions'][species] = mass_fractions[species][0]
+                else:
+                    self.models[ins].model_parameters['filling_species'][species] = mass_fractions[species][0]
+
+            ## This is not enough; we also need to impose mass fractions for the filling line species.
+            for lfs in self.data_dict[ins]['filling_line_species']:
+                self.models[ins].model_parameters['imposed_mass_fractions'][lfs] = mass_fractions[lfs][0]
 
     def gaussian_log_likelihood(self, residuals, variances):
         taus = 1. / variances

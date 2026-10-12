@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.stats import gamma, norm, beta, truncnorm, lognorm
+from scipy.special import logsumexp
 
 def generate_priors(params, dists, hyperps):
     priors = {}
@@ -86,3 +87,33 @@ def transform_truncated_normal(x, hyperparameters):
 def transform_modifiedjeffreys(x, hyperparameters):
     turn, hi = hyperparameters
     return turn * (np.exp((x + 1e-10) * np.log(hi / turn + 1)) - 1)
+
+def transform_clr(x, hyperparameters):
+    ## Centred-log-ratio (CLR) prior on the abundances of n species (Benneke & Seager 2012, ApJ 753, 100).
+    ## x are the unit-cube values of the first n-1 species (shape (..., n-1)); the n-th species is dependent,
+    ## because the CLR variables xi_i = ln(X_i / g(X)) (g: geometric mean) must add up to zero.
+    ## hyperparameters is log10 of the minimum abundance allowed for any species (e.g., -12).
+    ## Returns the log10 abundances of all n species (shape (..., n)), which add up to 1. Points outside the
+    ## allowed simplex (any abundance below the minimum) are NOT removed here; the caller has to reject them.
+    x = np.asarray(x, dtype=float)
+    n = x.shape[-1] + 1
+    ln_xmin = hyperparameters * np.log(10.)
+    ## Bounds on xi_i, corresponding to X_i = X_min (with the rest equally abundant) and to X_i ~ 1 (with the rest at X_min).
+    ## Same as in POSEIDON (MacDonald & Madhusudhan 2017).
+    xi_low = ((n - 1.) / n) * (ln_xmin + np.log(n - 1.))
+    xi_up = -((n - 1.) / n) * ln_xmin
+    xi = xi_low + (xi_up - xi_low) * x
+    xi = np.concatenate([xi, -np.sum(xi, axis=-1, keepdims=True)], axis=-1)
+    return (xi - logsumexp(xi, axis=-1, keepdims=True)) / np.log(10.)
+
+def clr_prior_volume(nfree, hyperparameters, nsamples=1000000, seed=42):
+    ## Fraction of the unit cube (of the nfree = n-1 free CLR parameters) which maps inside the allowed simplex.
+    ## Samples outside of it are rejected via the likelihood, so the evidence returned by the sampler has to be divided
+    ## by this fraction to get the evidence under the (normalised) CLR prior. Returns the fraction and its Monte Carlo error.
+    rng = np.random.default_rng(seed)
+    ok = np.zeros(nsamples, dtype=bool)
+    for i in range(0, nsamples, 100000):
+        log_ab = transform_clr(rng.uniform(size=(min(100000, nsamples - i), nfree)), hyperparameters)
+        ok[i:i + log_ab.shape[0]] = np.all(log_ab >= hyperparameters, axis=-1)
+    frac = np.mean(ok)
+    return frac, np.sqrt(frac * (1. - frac) / nsamples)
