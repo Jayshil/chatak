@@ -43,6 +43,9 @@ class load(object):
         self.instruments = []
         self.resolution = resolution
 
+        if self.pout[-1] != '/':
+            self.pout = self.pout + '/'
+
         ## Wavelength range to consider for the modeling. This should be a list or tuple with two elements: [wav_min, wav_max] in microns.
         ## ONLY used in case of forward models: in case of retrievals, the wavelength range is _ALWAYS_ determined by the data.
         self.wavelength_range = wavelength_range
