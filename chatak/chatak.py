@@ -20,17 +20,46 @@ import astropy.constants as con
 from tqdm import tqdm
 import pickle
 import os
+import warnings
 import multiprocessing
 from .utils import *
+from . import composition
 
 log2pi = np.log(2. * np.pi)  # ln(2*pi)
 
 class load(object):
+    ## Model settings that are saved in (and restored from) setup.txt. A value of None means "use the default".
+    _setup_defaults = {
+        'pressure_range': [-6, 2],
+        'pressure_points': 100,
+        'wavelength_range': None,
+        'filling_species': {},
+        'filling_line': [],
+        'cia': [],
+        'rayleigh_species': [],
+        'code': 'petit',
+        'petit_vmr': False,
+    }
+
     def __init__(self, wavelength=None, depth=None, depth_err=None, wav_band=None, res_func=None, priors=None, mode=None,\
-                 pressure_range=[-6, 2], pressure_points=100, wavelength_range=None, filling_species={}, filling_line=[],\
-                 cia=[], rayleigh_species=[], resolution='c-k', code='petit', petit_vmr=False, pout=None, pin=None, verbose=False):
+                 pressure_range=None, pressure_points=None, wavelength_range=None, filling_species=None, filling_line=None,\
+                 cia=None, rayleigh_species=None, resolution='c-k', code=None, petit_vmr=None, pout=None, pin=None, verbose=False):
         # Normal runs save wavelength-space inputs and per-instrument modes.
         # Forward runs only need priors and output location.
+        # Model settings (pressure grid, filling/CIA/Rayleigh species, etc.) are saved in setup.txt for every run;
+        # when pin is provided, they are restored from there.
+        passed_setup = {
+            'pressure_range': pressure_range,
+            'pressure_points': pressure_points,
+            'wavelength_range': wavelength_range,
+            'filling_species': filling_species,
+            'filling_line': filling_line,
+            'cia': cia,
+            'rayleigh_species': rayleigh_species,
+            'code': code,
+            'petit_vmr': petit_vmr,
+        }
+
         self.wavelength = wavelength
         self.depth = depth
         self.depth_err = depth_err
@@ -43,48 +72,21 @@ class load(object):
         self.instruments = []
         self.resolution = resolution
 
-        if self.pout[-1] != '/':
+        if self.pout is not None and self.pout[-1] != '/':
             self.pout = self.pout + '/'
 
-        ## Wavelength range to consider for the modeling. This should be a list or tuple with two elements: [wav_min, wav_max] in microns.
-        ## ONLY used in case of forward models: in case of retrievals, the wavelength range is _ALWAYS_ determined by the data.
-        self.wavelength_range = wavelength_range
-
-        ## Pressure range and resolution (in termns of number of points) to create pressure grid to generate models.
-        ## Pressure range is in log10(P) where P is in bar. The pressure grid will be created using np.logspace(pressure_range[0], pressure_range[1], pressure_points).
-        self.pressure_range = pressure_range
-        self.pressure_points = pressure_points
-
-        ## petitRADTRANS uses mass fractions instead of volume-mixing-ratios. So, by default, the abundances provided by the user
-        ## in case of petit=True, would be assumed to be mass fractions. However, the user can alternatively provide volume-mixing-ratios and 
-        ## set petit_vmr=True. In that case, the abundances will be converted to mass fractions using the mean molecular weight of the atmosphere calculated from the provided abundances.
-        self.petit_vmr = petit_vmr
-        
-        # CIA (collision-induced absorption) opacities to include in the modeling. 
-        # This should be a list of strings corresponding to the CIA species available in the opacity files (e.g., 'H2--H2', 'H2--He').
-        # I think this is only used for petitRADTRANS, but we can keep it as a general input for now.
-        self.cia = cia
-
-        # Rayleigh scattering species to include in the modeling.
-        # This should be a list of strings corresponding to the Rayleigh scattering species available in the opacity files (e.g., 'H2', 'He').
-        # I think this is only used for petitRADTRANS, but we can keep it as a general input for now.
-        self.rayleigh_species = rayleigh_species
-
-        # Filling species to include in the modeling.
-        # This should be a dictionary where the keys are the species names and the values are their corresponding weights.
-        self.filling_species = filling_species
-
-        # Whether a given filling species should be included as a line species in the modeling.
-        # This should be a list of strings corresponding to the filling species that should be treated as line species.
-        self.filling_line = filling_line
-
-        # The code to generate forward models; currently only petitRADTRANS is supported.
-        # Use petit for petitRADTRANS and poseidon for POSEIDON (POSEIDON support is planned but not yet implemented).
-        self.code = code
+        ## Setting the above model settings (with their defaults if not provided).
+        for key, value in passed_setup.items():
+            if value is None:
+                value = self._setup_defaults[key]
+                # Copy mutable defaults so that instances do not share them.
+                value = type(value)(value) if isinstance(value, (list, dict)) else value
+            setattr(self, key, value)
 
         self._spectrum_file = 'spectrum_data.txt'
         self._response_file = 'response_data.txt'
         self._priors_file = 'priors.txt'
+        self._setup_file = 'setup.txt'
         self.verbose = verbose
 
         if self.pin is not None:
@@ -94,14 +96,17 @@ class load(object):
                 raise ValueError('When pin is provided, do not pass wavelength, depth, depth_err, wav_band, res_func, priors, pout, or mode.')
             if resolution != 'c-k' and resolution is not None:
                 raise ValueError('When pin is provided, do not pass resolution explicitly; it will be restored from disk.')
-            self.read()
+            self.read(passed_setup)
             if self.pout is None:
-                self.pout = self.pin
+                self.pout = self.pin if self.pin[-1] == '/' else self.pin + '/'
             if isinstance(self.mode, str):
                 self.mode = self._normalize_mode(self.mode, self.instruments)
             if isinstance(self.resolution, (str, int, np.integer)):
                 self.resolution = self._normalize_resolution(self.resolution, self.instruments)
+            self._init_composition()
             self.datadict_preparation()
+            self._set_wavelength_ranges()
+            self.init_models()
             return
 
         if self.mode == 'forward-transmission' or self.mode == 'forward-emission':
@@ -111,6 +116,9 @@ class load(object):
             if self.priors is None or self.pout is None:
                 raise ValueError('Forward mode requires priors and pout.')
             self._validate_priors()
+            self._init_composition()
+            if self.composition is not None:
+                raise ValueError('clr/dirichlet priors are only for retrievals; for forward models, provide fixed abundances (VMRs with petit_vmr=True).')
             if not os.path.exists(self.pout):
                 os.makedirs(self.pout)
             self.instruments = ['FORWARD']
@@ -147,6 +155,7 @@ class load(object):
         if any(value is None for value in self.resolution.values()):
             raise ValueError('resolution must be provided for all instruments in normal runs.')
         self._validate_inputs()
+        self._init_composition()
         self.instruments = sorted(self.wavelength.keys())
 
         if not os.path.exists(self.pout):
@@ -154,14 +163,24 @@ class load(object):
 
         self.save()
         self.datadict_preparation()
+        self._set_wavelength_ranges()
 
+        # Initialize the models
+        self.init_models()
+
+    def _set_wavelength_ranges(self):
         ## Calculating the wavelength ranges for each instrument and saving them in the data dictionary.
         for ins in self.instruments:
             self.data_dict[ins]['wav_min'] = np.min(self.wavelength[ins]) - ( 1.2 * np.median( np.diff( self.wavelength[ins] ) ) )
             self.data_dict[ins]['wav_max'] = np.max(self.wavelength[ins]) + ( 1.2 * np.median( np.diff( self.wavelength[ins] ) ) )
 
-        # Initialize the models
-        self.init_models()
+    def _init_composition(self):
+        ## Detect composition (clr/dirichlet, with optional metal fraction) priors on the line species and validate them.
+        ## self.composition is None if no such priors are given.
+        self.composition = composition.composition_from_priors(self.priors, filling_species=self.filling_species,\
+                                                               filling_line=self.filling_line, petit_vmr=self.petit_vmr)
+        if self.composition is not None and self.verbose:
+            print(f"Using {self.composition['scheme']} composition priors on {self.composition['species']} with background {self.composition['background']}.")
 
     def _normalize_mode(self, mode, instrument_keys):
         # Allow either a single legacy mode string or a per-instrument mode dict.
@@ -303,7 +322,15 @@ class load(object):
             for param, value in self.priors.items():
                 distribution = value['distribution']
                 hyperparameters = value['hyperparameters']
-                f.write(f'{param:<{param_width}} {distribution:<{dist_width}} {repr(hyperparameters)}\n')
+                f.write(f'{param:<{param_width}} {distribution:<{dist_width}} {repr(to_builtin(hyperparameters))}\n')
+
+        # Save model settings (one "key value" line per setting) so that pin reruns do not need them again.
+        setup_path = os.path.join(self.pout, self._setup_file)
+        key_width = max(len(key) for key in self._setup_defaults.keys())
+        with open(setup_path, 'w') as f:
+            f.write(f'# {"setting":<{key_width}} value\n')
+            for key in self._setup_defaults.keys():
+                f.write(f'{key:<{key_width}} {repr(to_builtin(getattr(self, key)))}\n')
 
         if 'FORWARD' in self.mode.keys():
             return
@@ -342,8 +369,8 @@ class load(object):
             '# wav_band_micron response_function instrument',
         )
 
-    def read(self):
-        # Restore saved priors for every run; spectrum and response files are optional in forward mode.
+    def read(self, passed_setup=None):
+        # Restore saved priors and model settings for every run; spectrum and response files are optional in forward mode.
         if self.pin is None:
             raise ValueError('pin must be provided to read saved data.')
         if not os.path.isdir(self.pin):
@@ -369,6 +396,27 @@ class load(object):
                     raise ValueError(f'Could not parse hyperparameters for {param}: {hyperparameters_text}') from exc
                 priors[param] = {'distribution': distribution, 'hyperparameters': hyperparameters}
         self.priors = priors
+
+        # Restore model settings; older runs without setup.txt keep the settings passed to load.
+        setup_path = os.path.join(self.pin, self._setup_file)
+        if os.path.exists(setup_path):
+            if passed_setup is not None:
+                passed = [key for key, value in passed_setup.items() if value is not None]
+                if len(passed) > 0:
+                    raise ValueError(f'When pin is provided, do not pass {", ".join(passed)}; they will be restored from {setup_path}.')
+            with open(setup_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parts = line.split(None, 1)
+                    if len(parts) != 2 or parts[0] not in self._setup_defaults:
+                        raise ValueError(f'Invalid setup line: {line}')
+                    key, value_text = parts
+                    try:
+                        setattr(self, key, ast.literal_eval(value_text))
+                    except (ValueError, SyntaxError) as exc:
+                        raise ValueError(f'Could not parse setting {key}: {value_text}') from exc
 
         spectrum_path = os.path.join(self.pin, self._spectrum_file)
         response_path = os.path.join(self.pin, self._response_file)
@@ -447,7 +495,8 @@ class load(object):
 
             ### Array to save the line species which will be used in the modelling.
             self.data_dict[ self.instruments[i] ]['line_species'] = []
-            self.data_dict[ self.instruments[i] ]['logabundance'] = False
+            ### Line species whose abundances are given in log10 (i.e., line-log<species> priors).
+            self.data_dict[ self.instruments[i] ]['log_line_species'] = []
 
             ### Array to save the filling species which will be used in the modelling.
             self.data_dict[ self.instruments[i] ]['filling_species'] = []
@@ -513,7 +562,7 @@ class load(object):
                     if ( self.instruments[i] in pri.split('_') ) or ( len(pri.split('_')) == 1 ):
                         if pri.split('-')[1][0:3] == 'log':
                             self.data_dict[ self.instruments[i] ]['line_species'].append( pri.split('-')[1][3:] + resolution )
-                            self.data_dict[ self.instruments[i] ]['logabundance'] = True
+                            self.data_dict[ self.instruments[i] ]['log_line_species'].append( pri.split('-')[1][3:] + resolution )
                             if self.verbose:
                                 print(f"Adding line species {pri.split('-')[1][3:]} to instrument {self.instruments[i]} with log-abundance.")
                         else:
@@ -669,13 +718,26 @@ class fit(object):
         self.model_parameters = list(self.data.priors.keys())
         self.paramnames = []
         nfree = 0
+
+        # With composition (clr/dirichlet) priors, one of the listed species is computed from the others (if any), so it is not sampled.
+        self.composition = self.data.composition
+        implicit_prior = self.composition['implicit_prior'] if self.composition is not None else None
+
         for pname in self.model_parameters:
-            if self.data.priors[pname]['distribution'] == 'fixed':
+            if self.data.priors[pname]['distribution'].lower() == 'fixed':
                 self.posteriors[pname] = self.data.priors[pname]['hyperparameters']
+            elif pname == implicit_prior:
+                self.posteriors[pname] = None
             else:
                 self.posteriors[pname] = 0.
                 self.paramnames.append(pname)
                 nfree += 1
+
+        # For CLR priors, the prior is truncated to the part of the box that gives valid compositions; lnZ carries a factor equal to the acceptance fraction.
+        if self.composition is not None:
+            self.composition_acceptance = composition.acceptance_fraction(self.composition)
+            print(f"Composition prior ({self.composition['scheme']}, {self.composition['n']} components on the simplex): "
+                  f"acceptance fraction = {self.composition_acceptance:.4f}")
 
         self.transformed_priors = np.zeros(nfree)
 
@@ -685,6 +747,7 @@ class fit(object):
         # This avoids having to keep track of the prior distribution on each of the iterations. This is only useful for
         # nested samplers:
         self.transform_prior = {}
+        self.transform_hyperparameters = {}
         self.set_prior_transform()
 
         self.model = model(self.data, convolve=self.convolve, resolving_power=self.resolving_power)
@@ -718,7 +781,7 @@ class fit(object):
 
                     d_args = {}
                     d_args['bound'] = 'multi'
-                    d_args['sample'] = 'rwalk'
+                    d_args['sample'] = 'rwalk' if nfree < 20 else 'rslice'
                     d_args['nlive'] = self.n_live_points
                     # Match them with kwargs (kwargs take preference):
                     for arg in args:
@@ -770,7 +833,7 @@ class fit(object):
 
                     d_args = {}
                     d_args['bound'] = 'multi'
-                    d_args['sample'] = 'rwalk'
+                    d_args['sample'] = 'rwalk' if nfree < 20 else 'rslice'
                     d_args['nlive'] = self.n_live_points
                     # Match them with kwargs:
                     for arg in args:
@@ -894,16 +957,21 @@ class fit(object):
             for i in tqdm(range(posterior_samples.shape[0])):
                 out['posterior_samples']['loglike'][i] = self.loglike(posterior_samples[i, :])
 
-            pcounter = 0
-            for pname in self.model_parameters:
-                if self.data.priors[pname]['distribution'] != 'fixed':
-                    self.posteriors[pname] = np.median(posterior_samples[:, pcounter])
-                    out['posterior_samples'][pname] = posterior_samples[:, pcounter]
-                    pcounter += 1
+            for pcounter, pname in enumerate(self.paramnames):
+                self.posteriors[pname] = np.median(posterior_samples[:, pcounter])
+                out['posterior_samples'][pname] = posterior_samples[:, pcounter]
 
             # Get lnZ:
             out['lnZ'] = results.logz[-1]
             out['lnZerr'] = results.logzerr[-1]
+
+            if self.composition is not None:
+                out['composition_acceptance'] = self.composition_acceptance
+                # Derived quantities (abundances, mean molar mass, mass fractions, metal fraction, Z) for each posterior sample:
+                out['derived_samples'] = self.composition_derived_samples(out['posterior_samples'])
+                # Rename sampled composition parameters to what they are: xi-<species> (clr) or u-<species> (dirichlet)
+                out['posterior_samples'] = { self.composition['output_names'].get(pname, pname): value \
+                                             for pname, value in out['posterior_samples'].items() }
 
             pickle.dump(out, open(self.pout + self.sampler_prefix + 'posteriors.pkl', 'wb'))
 
@@ -911,6 +979,8 @@ class fit(object):
             # If the sampler was already ran, then user really wants to extract outputs from previous fit:
             print('Detected ' + self.sampler + ' sampler output files --- extracting from ' + self.pout + self.sampler_prefix + 'posteriors.pkl')
             out = pickle.load( open( self.pout + self.sampler_prefix + 'posteriors.pkl', 'rb'))
+            if self.composition is not None and 'derived_samples' not in out.keys():
+                out['derived_samples'] = self.composition_derived_samples(self.model.internal_parameter_names(out['posterior_samples']))
 
         # Either fit done or extracted. If doesn't exist, create the posteriors.dat file:
         if self.pout is not None:
@@ -924,11 +994,8 @@ class fit(object):
 
     def loglike(self, cube, ndim=None, nparams=None):
         # Evaluate the joint log-likelihood. For this, first extract all inputs:
-        pcounter = 0
-        for pname in self.model_parameters:
-            if self.data.priors[pname]['distribution'].lower() != 'fixed':
-                self.posteriors[pname] = cube[pcounter]
-                pcounter += 1
+        for pcounter, pname in enumerate(self.paramnames):
+            self.posteriors[pname] = cube[pcounter]
         # Initialize log-likelihood:
         log_likelihood = 0.0
 
@@ -950,9 +1017,20 @@ class fit(object):
         return log_likelihood
 
     def set_prior_transform(self):
-        for pname in self.model_parameters:
+        for pname in self.paramnames:
             dist_name = self.data.priors[pname]['distribution'].lower()
+            self.transform_hyperparameters[pname] = self.data.priors[pname]['hyperparameters']
             if dist_name != 'fixed':
+                if dist_name == 'clr':
+                    # CLR coordinates are uniform within the exact bounds for the number of components.
+                    self.transform_prior[pname] = transform_uniform
+                    self.transform_hyperparameters[pname] = self.composition['xi_bounds']
+                if dist_name == 'dirichlet':
+                    # Dirichlet priors sample the unit cube directly; the stick-breaking is done in the model.
+                    self.transform_prior[pname] = transform_uniform
+                    self.transform_hyperparameters[pname] = [0., 1.]
+                if dist_name == 'logituniform':
+                    self.transform_prior[pname] = transform_logituniform
                 if dist_name == 'uniform':
                     self.transform_prior[pname] = transform_uniform
                 if dist_name == 'normal':
@@ -970,14 +1048,22 @@ class fit(object):
 
     # Prior transform for nested samplers (this one spits the transformed priors from the unit cube):
     def prior_transform_r(self, cube):
-        pcounter = 0
         transformed_priors = np.copy(self.transformed_priors)
-        for pname in self.model_parameters:
-            if self.data.priors[pname]['distribution'].lower() != 'fixed':
-                transformed_priors[pcounter] = self.transform_prior[pname](cube[pcounter], \
-                                               self.data.priors[pname]['hyperparameters'])
-                pcounter += 1
+        for pcounter, pname in enumerate(self.paramnames):
+            transformed_priors[pcounter] = self.transform_prior[pname](cube[pcounter], \
+                                           self.transform_hyperparameters[pname])
         return transformed_priors
+
+    def composition_derived_samples(self, posterior_samples):
+        # Compute derived composition quantities for all posterior samples (keyed by prior names).
+        parameter_values = {}
+        for pname in self.model_parameters:
+            if self.data.priors[pname]['distribution'].lower() == 'fixed':
+                parameter_values[pname] = self.data.priors[pname]['hyperparameters']
+        parameter_values.update(posterior_samples)
+        theta = composition.theta_from_parameters(parameter_values, self.composition)
+        X, _ = composition.params_to_vmr(theta, self.composition)
+        return composition.derived_quantities(X, self.composition['X_min'], background=self.composition['background'])
 
 class model(object):
     def __init__(self, data, convolve=False, resolving_power=None):
@@ -991,6 +1077,10 @@ class model(object):
         self.models = self.data.models
 
         self.modelOK = True
+
+        ## Composition (clr/dirichlet) priors, if any; the VMRs of the current model are saved in composition_vmr.
+        self.composition = self.data.composition
+        self.composition_vmr = None
 
         ## Convolution settings
         self.convolve = convolve
@@ -1088,8 +1178,15 @@ class model(object):
         self.evaluate = self.evaluate_model
         self.generate = self.generate_forward_models
 
+    def internal_parameter_names(self, parameter_values):
+        ## Sampled composition parameters are saved as xi-<species>/u-<species> in the outputs; the model uses the prior names.
+        if self.composition is None:
+            return parameter_values
+        output2prior = { v: k for k, v in self.composition['output_names'].items() }
+        return { output2prior.get(pname, pname): value for pname, value in parameter_values.items() }
+
     def set_posterior_samples(self, posterior_samples):
-        self.posteriors = posterior_samples
+        self.posteriors = self.internal_parameter_names(posterior_samples)
         self.median_posterior_samples = {}
         
         for parameter in self.posteriors.keys():
@@ -1102,6 +1199,8 @@ class model(object):
         
         try:
             self.generate(self.median_posterior_samples, True)
+            if not self.modelOK:
+                print('Warning: the posterior median gives an invalid model (e.g., an invalid composition).')
         except:
             print(
                 'Warning: model evaluated at the posterior median did not compute properly.'
@@ -1123,6 +1222,7 @@ class model(object):
         if parameter_values is not None:
             ## Generate the model spectrum for the given parameter values.
             #### ---- parameter_values can be np.arrays (i.e., samples) or single values. 
+            parameter_values = self.internal_parameter_names(parameter_values)
             parameters = list(self.priors.keys())
             input_parameters = list(parameter_values.keys())
             if type(parameter_values[input_parameters[0]]) is np.ndarray:
@@ -1261,6 +1361,16 @@ class model(object):
         ## We will loop through the instruments and generate the model spectrum for each instrument using the SpectralModel class from petitRADTRANS (or the appropriate class for the chosen forward model code).
 
         self.modelOK = True
+
+        ## With composition priors, compute the VMRs once (they are the same for all instruments);
+        ## invalid compositions (CLR points outside the floor) are rejected without calling the forward model.
+        if self.composition is not None:
+            theta = composition.theta_from_parameters(parameter_values, self.composition)
+            X, valid = composition.params_to_vmr(theta, self.composition)
+            if not valid:
+                self.modelOK = False
+                return
+            self.composition_vmr = { sp: float(x) for sp, x in X.items() }
         
         for ins in self.instruments:
             if self.data.code == 'petit':
@@ -1307,13 +1417,14 @@ class model(object):
                 ## Let's check the sum of the abundances of all species (it should ideally be 1)
                 ## In case there are filling species, we do not calculate the absolute abundances of the filling species, but rather, their ratio.
                 ## So in that case, we need to check that the sum of the non-filling species' abundances is less than or equal to 1
-                if len(self.data_dict[ins]['filling_species']) == 0:
+                ## With composition priors, the abundances sum to 1 by construction, so no check is needed.
+                if self.composition is None and len(self.data_dict[ins]['filling_species']) == 0:
                     ## That means there no filling species, so the sum of all species' abundances should ideally be 1
                     total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
                     if not np.isclose(total_abundance, 1.0):
                         print(f"Total abundance of all species should ideally be 1, but got {total_abundance}")
                         self.modelOK = False
-                else:
+                elif self.composition is None:
                     ## There are filling species, so the sum of the non-filling species' abundances should be less than or equal to 1
                     total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
                     if total_abundance > 1.0:
@@ -1329,7 +1440,11 @@ class model(object):
                         self.models[ins].model_parameters['rebinned_wavelengths'] = ( self.data.wavelength[ins] * u.micron ).to(u.cm).value
 
                     if self.modelOK:
-                        forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin, convolve=self.convolve)
+                        with warnings.catch_warnings():
+                            if self.composition is not None:
+                                ## All species are imposed with mass fractions summing to 1; pRT warns about sums < 1 at the 1e-16 level.
+                                warnings.filterwarnings('ignore', message='the sum of mass mixing ratios')
+                            forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin, convolve=self.convolve)
                         forward_wav_model = ( forward_wav_model[0,:] * u.cm ).to(u.micron).value
                         forward_spec_model = ( ( forward_spec_model[0,:] / rst_cm )**2 ) * 1e6
                     else:
@@ -1350,7 +1465,39 @@ class model(object):
                 raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.data.code}")
 
 
+    def line_abundance(self, ins, ls, parameter_values):
+        ## Abundance of line species ls (with the resolution suffix, if any) from the parameter values.
+        if type( self.data.resolution[ins] ) == int:
+            ls1 = ls.split('.')[0]
+        else:
+            ls1 = ls
+        if ls in self.data_dict[ins]['log_line_species']:
+            return 10 ** parameter_values[ 'line-log' + ls1 + self.line_inames[ins] ]
+        else:
+            return parameter_values[ 'line-' + ls1 + self.line_inames[ins] ]
+
+    def set_composition_abundances(self, ins):
+        ## With composition priors, all species (listed + background) have VMRs; clip them at X_min and impose mass fractions for all of them.
+        _, _, mass_fractions = composition.vmr_to_mass_fractions(self.composition_vmr, self.composition['X_min'])
+
+        ## Names of species with line opacities (e.g., CO2.R250 for CO2)
+        opacity_names = {}
+        for ls in self.data_dict[ins]['line_species']:
+            if type( self.data.resolution[ins] ) == int:
+                opacity_names[ ls.split('.')[0] ] = ls
+            else:
+                opacity_names[ls] = ls
+
+        self.models[ins].model_parameters['imposed_mass_fractions'] = {}
+        for species in mass_fractions.keys():
+            self.models[ins].model_parameters['imposed_mass_fractions'][ opacity_names.get(species, species) ] = float(mass_fractions[species])
+        self.models[ins].model_parameters['filling_species'] = {}
+
     def set_abundances(self, ins, parameter_values):
+        if self.composition is not None:
+            self.set_composition_abundances(ins)
+            return
+
         ## List of line species for this instrument.
         self.models[ins].model_parameters['imposed_mass_fractions'] = {}
 
@@ -1363,17 +1510,7 @@ class model(object):
                 ## However, they are filling species, so they will not have priors. So, we need to skip them in this loop.
                 continue
 
-            ## If the resolution is int, then the name of the species would be something like 'CO2.R200'. 
-            ## Let's leave resolution out of the name of the species (used in case if petit_vmr is True).
-            if type( self.data.resolution[ins] ) == int:
-                ls1 = ls.split('.')[0]
-            else:
-                ls1 = ls
-
-            if self.data_dict[ins]['logabundance']:
-                abundance = 10 ** parameter_values[ 'line-log' + ls1 + self.line_inames[ins] ]
-            else:
-                abundance = parameter_values[ 'line-' + ls1 + self.line_inames[ins] ]
+            abundance = self.line_abundance(ins, ls, parameter_values)
             
             if not self.data.petit_vmr:
                 ## If petit_vmr is False, then we assume that the user has provided mass fractions directly.
@@ -1409,18 +1546,10 @@ class model(object):
             all_species_abundances = {}
             ## First, add the line species:
             for ls in self.data_dict[ins]['line_species']:
-                if type( self.data.resolution[ins] ) == int:
-                    ls1 = ls.split('.')[0]
-                else:
-                    ls1 = ls
-
                 if ls in self.data_dict[ins]['filling_line_species']:
                     continue
 
-                if self.data_dict[ins]['logabundance']:
-                    abundance = 10 ** parameter_values[ 'line-log' + ls1 + self.line_inames[ins] ]
-                else:
-                    abundance = parameter_values[ 'line-' + ls1 + self.line_inames[ins] ]
+                abundance = self.line_abundance(ins, ls, parameter_values)
 
                 all_species_abundances[ls] = abundance * np.ones(5)
 

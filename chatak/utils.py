@@ -1,6 +1,18 @@
 import numpy as np
 from scipy.stats import gamma, norm, beta, truncnorm, lognorm
-from scipy.special import logsumexp
+from scipy.special import logsumexp, expit
+
+def to_builtin(value):
+    # Convert numpy scalars/arrays (recursively) to plain python objects, so that repr() can be read back with ast.literal_eval.
+    if isinstance(value, dict):
+        return {to_builtin(k): to_builtin(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(to_builtin(v) for v in value)
+    if isinstance(value, np.ndarray):
+        return to_builtin(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 def generate_priors(params, dists, hyperps):
     priors = {}
@@ -53,7 +65,19 @@ def writepp(fout, posteriors, priors):
             fout.write(
                 '{0:18} \t \t {1:.10f} \t \t {2:.10f} \t \t {3:.10f}\n'.format(
                     pname, val, usigma, dsigma))
-            
+
+    # Derived quantities (e.g., abundances, mean molar mass from composition priors), if any.
+    if 'derived_samples' in posteriors.keys():
+        fout.write('# Derived quantities\n')
+        for pname in posteriors['derived_samples'].keys():
+            val, valup, valdown = get_quantiles(
+                posteriors['derived_samples'][pname])
+            usigma = valup - val
+            dsigma = val - valdown
+            fout.write(
+                '{0:18} \t \t {1:.10f} \t \t {2:.10f} \t \t {3:.10f}\n'.format(
+                    pname, val, usigma, dsigma))
+
     fout.close()
 
 # Prior transforms for nested samplers:
@@ -70,6 +94,11 @@ def transform_loguniform(x, hyperparameters):
 def transform_normal(x, hyperparameters):
     mu, sigma = hyperparameters
     return norm.ppf(x, loc=mu, scale=sigma)
+
+def transform_logituniform(x, hyperparameters):
+    # Uniform in logit(y) = ln[y/(1-y)] between a and b; returns y in (0, 1).
+    a, b = hyperparameters
+    return expit(a + x * (b - a))
 
 def transform_beta(x, hyperparameters):
     a, b = hyperparameters
