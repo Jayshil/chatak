@@ -634,9 +634,9 @@ class load(object):
 
         # Warn (without breaking execution) if setups differ across instruments.
         if len(self.instruments) > 1:
-            fit_values = [self.data_dict[ins]['petitIsoTrans'] for ins in self.instruments]
+            fit_values = [self.data_dict[ins]['temperature_profile'] for ins in self.instruments]
             if len(set(fit_values)) > 1:
-                print('Warning: fitting type is different across instruments.')
+                print('Warning: temperature profile is different across instruments.')
 
             line_sets = [tuple(sorted(set(self.data_dict[ins]['line_species']))) for ins in self.instruments]
             if len(set(line_sets)) > 1:
