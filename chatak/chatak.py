@@ -1470,19 +1470,19 @@ class model(object):
                     else:
                         forward_wav_model, forward_spec_model = np.copy(self.data.wavelength[ins]), np.ones(len(self.data.wavelength[ins]))
 
-                # We don't need offset and sigma_w for forward models
-                if 'FORWARD' in self.data.mode.keys():
-                    parameter_values['offset_' + ins ] = 0.0
-                    parameter_values['sigma_w_' + ins ] = 0.0
-
-                self.model_spec[ins]['wavelength'] = forward_wav_model
-                self.model_spec[ins]['spectrum'] = forward_spec_model + parameter_values['offset_' + ins ]
-
-                if 'FORWARD' not in self.data.mode.keys():
-                    self.model_spec[ins]['variances'] = self.data.depth_err[ins] ** 2 + parameter_values['sigma_w_' + ins ] ** 2
-
             else:
                 raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.data.code}")
+
+            # We don't need offset and sigma_w for forward models
+            if 'FORWARD' in self.data.mode.keys():
+                parameter_values['offset_' + ins ] = 0.0
+                parameter_values['sigma_w_' + ins ] = 0.0
+
+            self.model_spec[ins]['wavelength'] = forward_wav_model
+            self.model_spec[ins]['spectrum'] = forward_spec_model + parameter_values['offset_' + ins ]
+
+            if 'FORWARD' not in self.data.mode.keys():
+                self.model_spec[ins]['variances'] = self.data.depth_err[ins] ** 2 + parameter_values['sigma_w_' + ins ] ** 2
 
 
     def line_abundance(self, ins, ls, parameter_values):
