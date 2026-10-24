@@ -1126,10 +1126,16 @@ class model(object):
                 self.model_spec[ins]['wavelength'] = np.zeros_like( self.data.depth[ins] )
                 self.model_spec[ins]['spectrum'] = np.zeros_like( self.data.depth[ins] )
                 self.model_spec[ins]['variances'] = np.zeros_like( self.data.depth_err[ins] )
+
+                self.model_spec[ins]['deterministic'] = np.zeros_like( self.data.depth[ins] )
+                self.model_spec[ins]['LM'] = np.zeros_like( self.data.depth[ins] )
             else:
                 self.model_spec[ins]['wavelength'] = np.zeros( 1000 )  # Placeholder wavelength array for forward runs; actual wavelengths will depend on the forward model setup.
                 self.model_spec[ins]['spectrum'] = np.zeros( 1000 )  # Placeholder spectrum array for forward runs; actual values will be computed by the forward model.
                 self.model_spec[ins]['variances'] = np.zeros( 1000 )  # Placeholder variances array for forward runs; actual values will be computed by the forward model.
+
+                self.model_spec[ins]['deterministic'] = np.zeros( 1000 )
+                self.model_spec[ins]['LM'] = np.zeros( 1000 )
 
             for pri in self.priors.keys():
                 if pri[0:4].lower() == 'line':
@@ -1301,7 +1307,7 @@ class model(object):
                         self.generate_forward_models(current_parameter_values, rebin=False)
                         output_model_wavelengths = self.model_spec[instrument]['wavelength']
                     
-                    output_model_samples[i,:] = self.model_spec[instrument]['spectrum']
+                    output_model_samples[i,:] = self.model_spec[instrument]['deterministic']
                 
                 # If return_error is on, return upper and lower sigma (alpha x 100% CI) of the model(s):
                 if return_err:
@@ -1323,7 +1329,7 @@ class model(object):
                     self.generate_forward_models(parameter_values, rebin=False)
                     output_model_wavelengths = self.model_spec[instrument]['wavelength']
 
-                output_model = self.model_spec[instrument]['spectrum']
+                output_model = self.model_spec[instrument]['deterministic']
 
         else:
             ## We will use the posteriors to generate the model spectrum.
@@ -1479,7 +1485,9 @@ class model(object):
                 parameter_values['sigma_w_' + ins ] = 0.0
 
             self.model_spec[ins]['wavelength'] = forward_wav_model
-            self.model_spec[ins]['spectrum'] = forward_spec_model + parameter_values['offset_' + ins ]
+            self.model_spec[ins]['spectrum'] = forward_spec_model 
+            
+            self.model_spec[ins]['deterministic'] = self.model_spec[ins]['spectrum'] + parameter_values['offset_' + ins ]
 
             if 'FORWARD' not in self.data.mode.keys():
                 self.model_spec[ins]['variances'] = self.data.depth_err[ins] ** 2 + parameter_values['sigma_w_' + ins ] ** 2
@@ -1605,6 +1613,6 @@ class model(object):
         # This function will calculate the log-likelihood.
         log_like = 0.0
         for ins in self.instruments:
-            resids = self.data.depth[ins] - self.model_spec[ins]['spectrum']
+            resids = self.data.depth[ins] - self.model_spec[ins]['deterministic']
             log_like += self.gaussian_log_likelihood(resids, self.model_spec[ins]['variances'])
         return log_like
