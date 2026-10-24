@@ -491,7 +491,13 @@ class load(object):
             
             ### Listing different names of the fitting and set them False by default.
             ### We will set them True depending on the priors.
-            self.data_dict[ self.instruments[i] ]['petitIsoTrans'] = False
+            #### Flags for transmission of emission fitting with petitRADTRANS (determined by data.code and data.mode)
+            self.data_dict[ self.instruments[i] ]['petitTrans'] = False
+            self.data_dict[ self.instruments[i] ]['petitEmiss'] = False
+
+            ## Temperature profile (function to create temperature profile)
+            self.data_dict[ self.instruments[i] ]['temperature_profile'] = None
+            self.data_dict[ self.instruments[i] ]['temperature_profile_func'] = None
 
             ### Array to save the line species which will be used in the modelling.
             self.data_dict[ self.instruments[i] ]['line_species'] = []
@@ -544,16 +550,27 @@ class load(object):
                 if ( self.instruments[i] in fs.split('_') ) or ( len(fs.split('_')) == 1 ):
                     self.data_dict[ self.instruments[i] ]['filling_species'].append(fs + resolution)
                     self.data_dict[ self.instruments[i] ]['filling_species_weights'][fs + resolution] = self.filling_species[fs]
+
+            ## Setting flags for transmission and emission fitting
+            if self.code == 'petit':
+                if self.mode[self.instruments[i]] == 'transmission' or self.mode[self.instruments[i]] == 'forward-transmission':
+                    self.data_dict[ self.instruments[i] ]['petitTrans'] = True
+                    if self.verbose:
+                        print(f"Setting petitRADTRANS transmission fitting for instrument {self.instruments[i]}.")
+                elif self.mode[self.instruments[i]] == 'emission' or self.mode[self.instruments[i]] == 'forward-emission':
+                    self.data_dict[ self.instruments[i] ]['petitEmiss'] = True
+                    if self.verbose:
+                        print(f"Setting petitRADTRANS emission fitting for instrument {self.instruments[i]}.")
             
             for pri in self.priors.keys():
                 
                 if pri[0:7].lower() == 'isotemp':
                     if ( self.instruments[i] in pri.split('_') ) or ( len(pri.split('_')) == 1 ):
                         if self.code == 'petit':
-                            if self.mode[self.instruments[i]] == 'transmission' or self.mode[self.instruments[i]] == 'forward-transmission':
-                                self.data_dict[ self.instruments[i] ]['petitIsoTrans'] = True
-                                if self.verbose:
-                                    print(f"Setting petitRADTRANS isothermal transmission fitting for instrument {self.instruments[i]}.")
+                            self.data_dict[ self.instruments[i] ]['temperature_profile'] = 'isothermal'
+                            self.data_dict[ self.instruments[i] ]['temperature_profile_func'] = TP_isothermal
+                            if self.verbose:
+                                print(f"Setting petitRADTRANS isothermal transmission fitting for instrument {self.instruments[i]}.")
                         else:
                             raise NotImplementedError(f"Isothermal fitting is currently only implemented for petitRADTRANS. Unsupported code: {self.code}")
                         
@@ -643,7 +660,9 @@ class load(object):
                                                                    rayleigh_species=self.rayleigh_species,
                                                                    gas_continuum_contributors=self.cia,
                                                                    wavelength_boundaries=[self.data_dict[ self.instruments[i] ]['wav_min'], self.data_dict[ self.instruments[i] ]['wav_max']],
-                                                                   line_opacity_mode=self.data_dict[ self.instruments[i] ]['opacity_mode']
+                                                                   line_opacity_mode=self.data_dict[ self.instruments[i] ]['opacity_mode'],
+                                                                   ## Temperature profile function
+                                                                   model_functions_map={'temperatures': self.data_dict[ self.instruments[i] ]['temperature_profile_func']}
                                                                   )
             else:
                 raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.code}")
@@ -1431,11 +1450,12 @@ class model(object):
                         print(f"Total abundance of non-filling species should be less than or equal to 1, but got {total_abundance}")
                         self.modelOK = False
 
-                ## Setting the parameters for temperature profile
-                if self.data_dict[ins]['petitIsoTrans']:
-                    self.models[ins].model_parameters['temperature_profile_mode'] = 'isothermal'
-                    self.models[ins].model_parameters['temperature'] = parameter_values['isotemp' + self.tp_inames[ins] ]
+                ## ------ Setting the temperature profile parameters
+                if self.data_dict[ins]['temperature_profile'] == 'isothermal':
+                    self.models[ins].model_parameters['T_iso'] = parameter_values['isotemp' + self.tp_inames[ins] ]
 
+                # ------ Calculating the spectrum
+                if self.data_dict[ins]['petitTrans']:
                     if rebin:
                         self.models[ins].model_parameters['rebinned_wavelengths'] = ( self.data.wavelength[ins] * u.micron ).to(u.cm).value
 

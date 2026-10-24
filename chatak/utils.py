@@ -1,6 +1,22 @@
 import numpy as np
 from scipy.stats import gamma, norm, beta, truncnorm, lognorm
 from scipy.special import logsumexp, expit
+try:
+    from petitRADTRANS.physics import (
+        cubic_spline_profile,
+        dtdp_temperature_profile,
+        flux2irradiance,
+        linear_spline_profile,
+        madhu_seager_2009,
+        planck_function_cm,
+        power_law_temperature_profile,
+        temperature_profile_function_guillot_global,
+        temperature_profile_function_isothermal,
+        temperature_profile_function_ret_model
+    )
+except:
+    pass
+
 
 def to_builtin(value):
     # Convert numpy scalars/arrays (recursively) to plain python objects, so that repr() can be read back with ast.literal_eval.
@@ -116,3 +132,8 @@ def transform_truncated_normal(x, hyperparameters):
 def transform_modifiedjeffreys(x, hyperparameters):
     turn, hi = hyperparameters
     return turn * (np.exp((x + 1e-10) * np.log(hi / turn + 1)) - 1)
+
+
+# --------------------- Temperature profile functions
+def TP_isothermal(pressures, T_iso, **kwargs):
+    return np.ones_like(pressures) * T_iso
