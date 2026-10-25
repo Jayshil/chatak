@@ -43,7 +43,8 @@ class load(object):
 
     def __init__(self, wavelength=None, depth=None, depth_err=None, wav_band=None, res_func=None, priors=None, mode=None,\
                  pressure_range=None, pressure_points=None, wavelength_range=None, filling_species=None, filling_line=None,\
-                 cia=None, rayleigh_species=None, resolution='c-k', code=None, petit_vmr=None, pout=None, pin=None, verbose=False):
+                 cia=None, rayleigh_species=None, resolution='c-k', code=None, petit_vmr=None, LM_regressors=None, GP_regressors=None,\
+                 NLM=None, pout=None, pin=None, verbose=False):
         # Normal runs save wavelength-space inputs and per-instrument modes.
         # Forward runs only need priors and output location.
         # Model settings (pressure grid, filling/CIA/Rayleigh species, etc.) are saved in setup.txt for every run;
@@ -66,6 +67,9 @@ class load(object):
         self.wav_band = wav_band
         self.res_func = res_func
         self.priors = priors
+        self.LM_regressors = LM_regressors
+        self.GP_regressors = GP_regressors
+        self.NLM = NLM
         self.pout = pout
         self.pin = pin
         self.mode = mode
@@ -87,13 +91,17 @@ class load(object):
         self._response_file = 'response_data.txt'
         self._priors_file = 'priors.txt'
         self._setup_file = 'setup.txt'
+        self._lm_file = 'lm.txt'
+        self._gp_file = 'gp.txt'
+        self._nlm_file = 'nlm.txt'
+        self._nlm_func_file = 'nlm_functions.pkl'
         self.verbose = verbose
 
         if self.pin is not None:
             # Rerun mode: restore everything from the saved files.
-            provided = [wavelength, depth, depth_err, wav_band, res_func, priors, pout, mode]
+            provided = [wavelength, depth, depth_err, wav_band, res_func, priors, pout, mode, LM_regressors, GP_regressors, NLM]
             if any(value is not None for value in provided):
-                raise ValueError('When pin is provided, do not pass wavelength, depth, depth_err, wav_band, res_func, priors, pout, or mode.')
+                raise ValueError('When pin is provided, do not pass wavelength, depth, depth_err, wav_band, res_func, priors, pout, mode, LM_regressors, GP_regressors, or NLM.')
             if resolution != 'c-k' and resolution is not None:
                 raise ValueError('When pin is provided, do not pass resolution explicitly; it will be restored from disk.')
             self.read(passed_setup)
@@ -282,6 +290,58 @@ class load(object):
             raise ValueError('wav_band and res_func are required for all instruments with spectrum data.')
 
         self._validate_priors()
+        self._validate_regressors()
+
+    def _validate_regressors(self):
+        # Validate the optional LM_regressors / GP_regressors / NLM inputs. Each may be provided
+        # for only a subset of the instruments. Uses the wavelength keys (not self.instruments,
+        # which is still empty when _validate_inputs runs on a new run).
+        spec_keys = set(self.wavelength.keys())
+
+        def _check_keys(name, mapping):
+            if not isinstance(mapping, dict):
+                raise TypeError(f'{name} must be a dict with instrument names as keys.')
+            unknown = set(mapping.keys()) - spec_keys
+            if unknown:
+                raise ValueError(f'{name} has unknown instrument keys: {", ".join(sorted(unknown))}.')
+
+        if self.LM_regressors:
+            _check_keys('LM_regressors', self.LM_regressors)
+            for ins, arr in self.LM_regressors.items():
+                a = np.asarray(arr, dtype=float)
+                if a.ndim != 2:
+                    raise ValueError(f'LM_regressors for instrument {ins} must be 2D (len(wavelength), N).')
+                if a.shape[0] != len(self.wavelength[ins]):
+                    raise ValueError(f'LM_regressors for instrument {ins} must have {len(self.wavelength[ins])} rows (one per wavelength).')
+                n = a.shape[1]
+                if n < 1:
+                    raise ValueError(f'LM_regressors for instrument {ins} must have at least one column.')
+                # Require a theta prior per regressor column: theta0_<ins> ... theta{N-1}_<ins>.
+                missing = [f'theta{k}_{ins}' for k in range(n) if f'theta{k}_{ins}' not in self.priors]
+                if missing:
+                    raise ValueError(f'Missing priors for LM_regressors of instrument {ins}: {", ".join(missing)}.')
+
+        if self.GP_regressors:
+            _check_keys('GP_regressors', self.GP_regressors)
+            for ins, arr in self.GP_regressors.items():
+                a = np.asarray(arr, dtype=float)
+                if a.ndim != 1:
+                    raise ValueError(f'GP_regressors for instrument {ins} must be 1D.')
+                if len(a) != len(self.wavelength[ins]):
+                    raise ValueError(f'GP_regressors for instrument {ins} must have the same length as its wavelength array.')
+
+        if self.NLM:
+            _check_keys('NLM', self.NLM)
+            for ins, entry in self.NLM.items():
+                if not isinstance(entry, dict) or set(entry.keys()) != {'regressors', 'function'}:
+                    raise ValueError(f"NLM for instrument {ins} must be a dict with keys 'regressors' and 'function'.")
+                a = np.asarray(entry['regressors'], dtype=float)
+                if a.ndim != 1:
+                    raise ValueError(f'NLM regressors for instrument {ins} must be 1D.')
+                if len(a) != len(self.wavelength[ins]):
+                    raise ValueError(f'NLM regressors for instrument {ins} must have the same length as its wavelength array.')
+                if not callable(entry['function']):
+                    raise TypeError(f'NLM function for instrument {ins} must be callable.')
 
     def _write_multicolumn_txt(self, filename, rows, header):
         # Write ASCII tables with a single commented header line.
@@ -304,6 +364,40 @@ class load(object):
                         f'File {filename} has malformed line with {len(cols)} columns; expected {expected_cols}.'
                     )
                 rows.append(cols)
+        return rows
+
+    def _import_function_pickler(self):
+        # NLM stores an arbitrary Python function per instrument; plain pickle only stores a
+        # module+qualname reference, so we use cloudpickle/dill (which serialize by value) to
+        # survive re-runs where the function was defined in a script. Imported lazily, like the
+        # other optional dependencies (petitRADTRANS, ultranest).
+        try:
+            import cloudpickle as pickler
+        except ImportError:
+            try:
+                import dill as pickler
+            except ImportError:
+                raise ImportError(
+                    'Saving/restoring NLM requires cloudpickle or dill (pip install cloudpickle).'
+                )
+        return pickler
+
+    def _read_regressor_rows(self, filename):
+        # Read a wavelength/instrument/regressors table where the number of regressor columns
+        # may differ between instruments (used by lm.txt). Returns a list of
+        # (wavelength, instrument, [regressor floats]) tuples, skipping blank/comment lines.
+        rows = []
+        with open(filename, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                cols = line.split()
+                if len(cols) < 3:
+                    raise ValueError(
+                        f'File {filename} has malformed line with {len(cols)} columns; expected at least 3.'
+                    )
+                rows.append((float(cols[0]), cols[1], [float(c) for c in cols[2:]]))
         return rows
 
     def save(self):
@@ -368,6 +462,57 @@ class load(object):
             response_rows,
             '# wav_band_micron response_function instrument',
         )
+
+        self._save_regressors()
+
+    def _save_regressors(self):
+        # Persist the optional LM_regressors / GP_regressors / NLM inputs (normal runs only;
+        # save() returns before this for FORWARD runs). Each may cover only a subset of
+        # instruments, so only the provided instruments are written.
+        if self.LM_regressors:
+            lm_rows = []
+            for ins in self.LM_regressors:
+                wav = np.asarray(self.wavelength[ins], dtype=float)
+                reg = np.asarray(self.LM_regressors[ins], dtype=float)
+                for i in range(len(wav)):
+                    values = ' '.join(f'{v:.16e}' for v in reg[i])
+                    lm_rows.append(f'{wav[i]:.16e} {ins} {values}')
+            self._write_multicolumn_txt(
+                os.path.join(self.pout, self._lm_file),
+                lm_rows,
+                '# wavelength_micron instrument theta_regressors(N_columns_vary_per_instrument)',
+            )
+
+        if self.GP_regressors:
+            gp_rows = []
+            for ins in self.GP_regressors:
+                wav = np.asarray(self.wavelength[ins], dtype=float)
+                reg = np.asarray(self.GP_regressors[ins], dtype=float)
+                for i in range(len(wav)):
+                    gp_rows.append(f'{wav[i]:.16e} {ins} {reg[i]:.16e}')
+            self._write_multicolumn_txt(
+                os.path.join(self.pout, self._gp_file),
+                gp_rows,
+                '# wavelength_micron instrument gp_regressor',
+            )
+
+        if self.NLM:
+            nlm_rows = []
+            functions = {}
+            for ins in self.NLM:
+                wav = np.asarray(self.wavelength[ins], dtype=float)
+                reg = np.asarray(self.NLM[ins]['regressors'], dtype=float)
+                for i in range(len(wav)):
+                    nlm_rows.append(f'{wav[i]:.16e} {ins} {reg[i]:.16e}')
+                functions[ins] = self.NLM[ins]['function']
+            self._write_multicolumn_txt(
+                os.path.join(self.pout, self._nlm_file),
+                nlm_rows,
+                '# wavelength_micron instrument nlm_regressor',
+            )
+            pickler = self._import_function_pickler()
+            with open(os.path.join(self.pout, self._nlm_func_file), 'wb') as f:
+                pickler.dump(functions, f)
 
     def read(self, passed_setup=None):
         # Restore saved priors and model settings for every run; spectrum and response files are optional in forward mode.
@@ -470,7 +615,51 @@ class load(object):
         self.wav_band = {k: np.asarray(v, dtype=float) for k, v in wav_band.items()}
         self.res_func = {k: np.asarray(v, dtype=float) for k, v in res_func.items()}
 
+        self._read_regressors()
+
         self._validate_inputs()
+
+    def _read_regressors(self):
+        # Restore the optional LM_regressors / GP_regressors / NLM inputs from pin. Each file is
+        # optional (older runs, or runs without regressors); the attribute stays None when absent.
+        lm_path = os.path.join(self.pin, self._lm_file)
+        if os.path.exists(lm_path):
+            lm_rows = self._read_regressor_rows(lm_path)
+            lm = {}
+            for wav, ins, values in lm_rows:
+                if ins not in lm:
+                    lm[ins] = []
+                elif len(values) != len(lm[ins][0]):
+                    raise ValueError(f'Inconsistent number of LM regressor columns for instrument {ins} in {lm_path}.')
+                lm[ins].append(values)
+            self.LM_regressors = {k: np.asarray(v, dtype=float) for k, v in lm.items()}
+
+        gp_path = os.path.join(self.pin, self._gp_file)
+        if os.path.exists(gp_path):
+            gp_rows = self._read_multicolumn_txt(gp_path, expected_cols=3)
+            gp = {}
+            for wav, ins, value in gp_rows:
+                gp.setdefault(ins, []).append(float(value))
+            self.GP_regressors = {k: np.asarray(v, dtype=float) for k, v in gp.items()}
+
+        nlm_path = os.path.join(self.pin, self._nlm_file)
+        if os.path.exists(nlm_path):
+            func_path = os.path.join(self.pin, self._nlm_func_file)
+            if not os.path.exists(func_path):
+                raise FileNotFoundError(f'Missing saved NLM functions file: {func_path}')
+            pickler = self._import_function_pickler()
+            with open(func_path, 'rb') as f:
+                functions = pickler.load(f)
+            nlm_rows = self._read_multicolumn_txt(nlm_path, expected_cols=3)
+            regressors = {}
+            for wav, ins, value in nlm_rows:
+                regressors.setdefault(ins, []).append(float(value))
+            nlm = {}
+            for ins, reg in regressors.items():
+                if ins not in functions:
+                    raise ValueError(f'Missing saved NLM function for instrument {ins} in {func_path}.')
+                nlm[ins] = {'regressors': np.asarray(reg, dtype=float), 'function': functions[ins]}
+            self.NLM = nlm
 
     def _parse_resolution_value(self, value):
         # Try to restore integer resolutions, otherwise keep the original string label.
