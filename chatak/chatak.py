@@ -1483,9 +1483,10 @@ class model(object):
                 else:
                     raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.data.code}")
 
-            # We don't need offset and sigma_w for forward models
-            if 'FORWARD' in self.data.mode.keys():
+            # We will ensure that offset and sigma_w parameters exist for this instrument, setting them to 0 if they are not provided.
+            if 'offset_' + ins not in parameter_values.keys():
                 parameter_values['offset_' + ins ] = 0.0
+            if 'sigma_w_' + ins not in parameter_values.keys():
                 parameter_values['sigma_w_' + ins ] = 0.0
             
             self.model_spec[ins]['deterministic'] = self.model_spec[ins]['spectrum'] + parameter_values['offset_' + ins ]
