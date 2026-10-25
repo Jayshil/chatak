@@ -1471,10 +1471,10 @@ class model(object):
                                 ## All species are imposed with mass fractions summing to 1; pRT warns about sums < 1 at the 1e-16 level.
                                 warnings.filterwarnings('ignore', message='the sum of mass mixing ratios')
                             forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin, convolve=self.convolve)
-                        forward_wav_model = ( forward_wav_model[0,:] * u.cm ).to(u.micron).value
-                        forward_spec_model = ( ( forward_spec_model[0,:] / rst_cm )**2 ) * 1e6
+                        self.model_spec[ins]['wavelength'] = ( forward_wav_model[0,:] * u.cm ).to(u.micron).value
+                        self.model_spec[ins]['spectrum'] = ( ( forward_spec_model[0,:] / rst_cm )**2 ) * 1e6
                     else:
-                        forward_wav_model, forward_spec_model = np.copy(self.data.wavelength[ins]), np.ones(len(self.data.wavelength[ins]))
+                        self.model_spec[ins]['wavelength'], self.model_spec[ins]['spectrum'] = np.copy(self.data.wavelength[ins]), np.ones(len(self.data.wavelength[ins]))
 
             else:
                 raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.data.code}")
@@ -1483,9 +1483,6 @@ class model(object):
             if 'FORWARD' in self.data.mode.keys():
                 parameter_values['offset_' + ins ] = 0.0
                 parameter_values['sigma_w_' + ins ] = 0.0
-
-            self.model_spec[ins]['wavelength'] = forward_wav_model
-            self.model_spec[ins]['spectrum'] = forward_spec_model 
             
             self.model_spec[ins]['deterministic'] = self.model_spec[ins]['spectrum'] + parameter_values['offset_' + ins ]
 
