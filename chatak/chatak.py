@@ -1398,86 +1398,90 @@ class model(object):
             self.composition_vmr = { sp: float(x) for sp, x in X.items() }
         
         for ins in self.instruments:
-            if self.data.code == 'petit':
-                # Alright, we will generate the forward model using petitRADTRANS for this instrument.
 
-                self.set_abundances(ins=ins, parameter_values=parameter_values)
-                
-                ## Setting up other planetary parameters
-                ### Calculating and extracting the stellar radius in cm
-                rst = parameter_values['rst']
-                rst_cm = ( rst * u.R_sun ).to(u.cm).value
+            ## We do the calculation ONLY is there is temperature profile available for this instrument. Otherwise the spectrum is simply zeros
+            if self.data_dict[ins]['temperature_profile'] is not None:
 
-                rp = ( parameter_values['rprs'] * rst * u.R_sun ).to(u.cm).value
-                self.models[ins].model_parameters['planet_radius'] = rp
+                if self.data.code == 'petit':
+                    # Alright, we will generate the forward model using petitRADTRANS for this instrument.
 
-                ### Either mass or surface gravity must be provided.
-                if self.data_dict['mass_fit']:
-                    mp = parameter_values['mp'] * u.M_earth
-                    #self.models[ins].model_parameters['planet_mass'] = mp.to(u.g).value
-                    # Converting the mass to surface gravity using the radius:
-                    g = ( con.G * mp / ( rp * u.cm )**2 ).to(u.cm / u.s**2).value
-                    self.models[ins].model_parameters['reference_gravity'] = g
+                    self.set_abundances(ins=ins, parameter_values=parameter_values)
+                    
+                    ## Setting up other planetary parameters
+                    ### Calculating and extracting the stellar radius in cm
+                    rst = parameter_values['rst']
+                    rst_cm = ( rst * u.R_sun ).to(u.cm).value
+
+                    rp = ( parameter_values['rprs'] * rst * u.R_sun ).to(u.cm).value
+                    self.models[ins].model_parameters['planet_radius'] = rp
+
+                    ### Either mass or surface gravity must be provided.
+                    if self.data_dict['mass_fit']:
+                        mp = parameter_values['mp'] * u.M_earth
+                        #self.models[ins].model_parameters['planet_mass'] = mp.to(u.g).value
+                        # Converting the mass to surface gravity using the radius:
+                        g = ( con.G * mp / ( rp * u.cm )**2 ).to(u.cm / u.s**2).value
+                        self.models[ins].model_parameters['reference_gravity'] = g
+                    else:
+                        self.models[ins].model_parameters['reference_gravity'] = parameter_values['surfgrav']
+
+                    ## Reference pressure
+                    self.models[ins].model_parameters['reference_pressure'] = parameter_values['refP']
+
+                    ## Convolution settings for the model
+                    if self.convolve:
+                        if 'FORWARD' in self.data.mode.keys():
+                            self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power
+                        else:
+                            self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power[ins]
+
+                    ## See if the user has provided cloud top pressure
+                    if self.data_dict[ins]['gray_cloud']:
+                        self.models[ins].model_parameters['opaque_cloud_top_pressure'] = parameter_values['ctp' + self.ctp_inames[ins]]
+
+                    ## Setting the parameters for haze factor
+                    if self.data_dict[ins]['haze']:
+                        self.models[ins].model_parameters['haze_factor'] = parameter_values['hazefac' + self.haze_inames[ins]]
+
+                    ## Let's check the sum of the abundances of all species (it should ideally be 1)
+                    ## In case there are filling species, we do not calculate the absolute abundances of the filling species, but rather, their ratio.
+                    ## So in that case, we need to check that the sum of the non-filling species' abundances is less than or equal to 1
+                    ## With composition priors, the abundances sum to 1 by construction, so no check is needed.
+                    if self.composition is None and len(self.data_dict[ins]['filling_species']) == 0:
+                        ## That means there no filling species, so the sum of all species' abundances should ideally be 1
+                        total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
+                        if not np.isclose(total_abundance, 1.0):
+                            print(f"Total abundance of all species should ideally be 1, but got {total_abundance}")
+                            self.modelOK = False
+                    elif self.composition is None:
+                        ## There are filling species, so the sum of the non-filling species' abundances should be less than or equal to 1
+                        total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
+                        if total_abundance > 1.0:
+                            print(f"Total abundance of non-filling species should be less than or equal to 1, but got {total_abundance}")
+                            self.modelOK = False
+
+                    ## ------ Setting the temperature profile parameters
+                    if self.data_dict[ins]['temperature_profile'] == 'isothermal':
+                        self.models[ins].model_parameters['T_iso'] = parameter_values['isotemp' + self.tp_inames[ins] ]
+
+                    # ------ Calculating the spectrum
+                    if self.data_dict[ins]['petitTrans']:
+                        if rebin:
+                            self.models[ins].model_parameters['rebinned_wavelengths'] = ( self.data.wavelength[ins] * u.micron ).to(u.cm).value
+
+                        if self.modelOK:
+                            with warnings.catch_warnings():
+                                if self.composition is not None:
+                                    ## All species are imposed with mass fractions summing to 1; pRT warns about sums < 1 at the 1e-16 level.
+                                    warnings.filterwarnings('ignore', message='the sum of mass mixing ratios')
+                                forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin, convolve=self.convolve)
+                            self.model_spec[ins]['wavelength'] = ( forward_wav_model[0,:] * u.cm ).to(u.micron).value
+                            self.model_spec[ins]['spectrum'] = ( ( forward_spec_model[0,:] / rst_cm )**2 ) * 1e6
+                        else:
+                            self.model_spec[ins]['wavelength'], self.model_spec[ins]['spectrum'] = np.copy(self.data.wavelength[ins]), np.ones(len(self.data.wavelength[ins]))
+
                 else:
-                    self.models[ins].model_parameters['reference_gravity'] = parameter_values['surfgrav']
-
-                ## Reference pressure
-                self.models[ins].model_parameters['reference_pressure'] = parameter_values['refP']
-
-                ## Convolution settings for the model
-                if self.convolve:
-                    if 'FORWARD' in self.data.mode.keys():
-                        self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power
-                    else:
-                        self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power[ins]
-
-                ## See if the user has provided cloud top pressure
-                if self.data_dict[ins]['gray_cloud']:
-                    self.models[ins].model_parameters['opaque_cloud_top_pressure'] = parameter_values['ctp' + self.ctp_inames[ins]]
-
-                ## Setting the parameters for haze factor
-                if self.data_dict[ins]['haze']:
-                    self.models[ins].model_parameters['haze_factor'] = parameter_values['hazefac' + self.haze_inames[ins]]
-
-                ## Let's check the sum of the abundances of all species (it should ideally be 1)
-                ## In case there are filling species, we do not calculate the absolute abundances of the filling species, but rather, their ratio.
-                ## So in that case, we need to check that the sum of the non-filling species' abundances is less than or equal to 1
-                ## With composition priors, the abundances sum to 1 by construction, so no check is needed.
-                if self.composition is None and len(self.data_dict[ins]['filling_species']) == 0:
-                    ## That means there no filling species, so the sum of all species' abundances should ideally be 1
-                    total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
-                    if not np.isclose(total_abundance, 1.0):
-                        print(f"Total abundance of all species should ideally be 1, but got {total_abundance}")
-                        self.modelOK = False
-                elif self.composition is None:
-                    ## There are filling species, so the sum of the non-filling species' abundances should be less than or equal to 1
-                    total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
-                    if total_abundance > 1.0:
-                        print(f"Total abundance of non-filling species should be less than or equal to 1, but got {total_abundance}")
-                        self.modelOK = False
-
-                ## ------ Setting the temperature profile parameters
-                if self.data_dict[ins]['temperature_profile'] == 'isothermal':
-                    self.models[ins].model_parameters['T_iso'] = parameter_values['isotemp' + self.tp_inames[ins] ]
-
-                # ------ Calculating the spectrum
-                if self.data_dict[ins]['petitTrans']:
-                    if rebin:
-                        self.models[ins].model_parameters['rebinned_wavelengths'] = ( self.data.wavelength[ins] * u.micron ).to(u.cm).value
-
-                    if self.modelOK:
-                        with warnings.catch_warnings():
-                            if self.composition is not None:
-                                ## All species are imposed with mass fractions summing to 1; pRT warns about sums < 1 at the 1e-16 level.
-                                warnings.filterwarnings('ignore', message='the sum of mass mixing ratios')
-                            forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin, convolve=self.convolve)
-                        self.model_spec[ins]['wavelength'] = ( forward_wav_model[0,:] * u.cm ).to(u.micron).value
-                        self.model_spec[ins]['spectrum'] = ( ( forward_spec_model[0,:] / rst_cm )**2 ) * 1e6
-                    else:
-                        self.model_spec[ins]['wavelength'], self.model_spec[ins]['spectrum'] = np.copy(self.data.wavelength[ins]), np.ones(len(self.data.wavelength[ins]))
-
-            else:
-                raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.data.code}")
+                    raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.data.code}")
 
             # We don't need offset and sigma_w for forward models
             if 'FORWARD' in self.data.mode.keys():
