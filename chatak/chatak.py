@@ -709,6 +709,25 @@ class load(object):
             ### So, I am commenting out the rayleigh_species section.
             #self.data_dict[ self.instruments[i] ]['rayleigh_species'] = []
 
+            ### Setting up a boolean flag if the instrument has linear, GP, or non-linear regressors.
+            self.data_dict[ self.instruments[i] ]['has_LM'] = False
+            self.data_dict[ self.instruments[i] ]['has_GP'] = False
+            self.data_dict[ self.instruments[i] ]['has_NLM'] = False
+
+        ## Checking if any of the instruments have linear, GP, or non-linear regressors and updating the flags accordingly.
+        for i in range( len(self.instruments) ):
+            if self.LM_regressors is not None:
+                if self.LM_regressors.get(self.instruments[i], None) is not None:
+                    self.data_dict[ self.instruments[i] ]['has_LM'] = True
+
+            if self.GP_regressors is not None:
+                if self.GP_regressors.get(self.instruments[i], None) is not None:
+                    self.data_dict[ self.instruments[i] ]['has_GP'] = True
+            
+            if self.NLM is not None:
+                if self.NLM.get(self.instruments[i], None) is not None:
+                    self.data_dict[ self.instruments[i] ]['has_NLM'] = True
+
         # Let's see if the user wants to fit either for the planetary mass or the surface gravity.
         self.data_dict['mass_fit'] = False
         for pri in self.priors.keys():
@@ -842,19 +861,20 @@ class load(object):
     def init_models(self):
         self.models = {}
         for i in range( len( self.instruments ) ):
-            if self.code == 'petit':
-                self.models[ self.instruments[i] ] = SpectralModel(
-                                                                   pressures=np.logspace(self.pressure_range[0], self.pressure_range[1], self.pressure_points),
-                                                                   line_species=self.data_dict[ self.instruments[i] ]['line_species'],
-                                                                   rayleigh_species=self.rayleigh_species,
-                                                                   gas_continuum_contributors=self.cia,
-                                                                   wavelength_boundaries=[self.data_dict[ self.instruments[i] ]['wav_min'], self.data_dict[ self.instruments[i] ]['wav_max']],
-                                                                   line_opacity_mode=self.data_dict[ self.instruments[i] ]['opacity_mode'],
-                                                                   ## Temperature profile function
-                                                                   model_functions_map={'temperatures': self.data_dict[ self.instruments[i] ]['temperature_profile_func']}
-                                                                  )
-            else:
-                raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.code}")
+            if self.data_dict[ self.instruments[i] ]['temperature_profile'] is not None:
+                if self.code == 'petit':
+                    self.models[ self.instruments[i] ] = SpectralModel(
+                                                                    pressures=np.logspace(self.pressure_range[0], self.pressure_range[1], self.pressure_points),
+                                                                    line_species=self.data_dict[ self.instruments[i] ]['line_species'],
+                                                                    rayleigh_species=self.rayleigh_species,
+                                                                    gas_continuum_contributors=self.cia,
+                                                                    wavelength_boundaries=[self.data_dict[ self.instruments[i] ]['wav_min'], self.data_dict[ self.instruments[i] ]['wav_max']],
+                                                                    line_opacity_mode=self.data_dict[ self.instruments[i] ]['opacity_mode'],
+                                                                    ## Temperature profile function
+                                                                    model_functions_map={'temperatures': self.data_dict[ self.instruments[i] ]['temperature_profile_func']}
+                                                                    )
+                else:
+                    raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.code}")
     
     def generate_forward_models(self, save=True, **kwargs):
         # This function will generate forward models using model class.
@@ -1301,6 +1321,7 @@ class model(object):
         self.tp_inames = {}
         self.ctp_inames = {}
         self.haze_inames = {}
+        self.lm_inames = {}
 
         # Define a variable that will save the posterior samples:
         self.posteriors = None
@@ -1318,6 +1339,7 @@ class model(object):
 
                 self.model_spec[ins]['deterministic'] = np.zeros_like( self.data.depth[ins] )
                 self.model_spec[ins]['LM'] = np.zeros_like( self.data.depth[ins] )
+                self.model_spec[ins]['NLM'] = np.zeros_like( self.data.depth[ins] )
             else:
                 self.model_spec[ins]['wavelength'] = np.zeros( 1000 )  # Placeholder wavelength array for forward runs; actual wavelengths will depend on the forward model setup.
                 self.model_spec[ins]['spectrum'] = np.zeros( 1000 )  # Placeholder spectrum array for forward runs; actual values will be computed by the forward model.
@@ -1325,27 +1347,40 @@ class model(object):
 
                 self.model_spec[ins]['deterministic'] = np.zeros( 1000 )
                 self.model_spec[ins]['LM'] = np.zeros( 1000 )
+                self.model_spec[ins]['NLM'] = np.zeros( 1000 )
 
             for pri in self.priors.keys():
                 if pri[0:4].lower() == 'line':
                     vec = pri.split('_')
-                    if len(vec) > 1:
-                        ## This means that the prior is instrument-dependent.
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
                         if ins in vec:
                             self.line_inames[ins] = '_' + '_'.join(vec[1:])
-                    else:
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.line_inames[ins] = '_' + vec[1]
+                    elif len(vec) == 1:
                         ## This means that the prior is global (not instrument-dependent).
                         self.line_inames[ins] = ''
+                    else:
+                        raise Exception('Prior for line species is not properly defined: must be, e.g., line-CO2, line-CO2_inst or line-CO2_inst1_inst2. Currently is '+pri)
                 
                 if pri[0:5].lower() == 'cloud':
                     vec = pri.split('_')
-                    if len(vec) > 1:
-                        ## This means that the prior is instrument-dependent.
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
                         if ins in vec:
                             self.cloud_inames[ins] = '_' + '_'.join(vec[1:])
-                    else:
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.cloud_inames[ins] = '_' + vec[1]
+                    elif len(vec) == 1:
                         ## This means that the prior is global (not instrument-dependent).
                         self.cloud_inames[ins] = ''
+                    else:
+                        raise Exception('Prior for cloud species is not properly defined: must be, e.g., cloud, cloud_inst or cloud_inst1_inst2. Currently is '+pri)
 
                 ### No longer needed as Rayleigh species are now provided differently.
                 #if pri[0:8].lower() == 'rayleigh':
@@ -1360,33 +1395,65 @@ class model(object):
 
                 if pri[0:7].lower() == 'isotemp':
                     vec = pri.split('_')
-                    if len(vec) > 1:
-                        ## This means that the prior is instrument-dependent.
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
                         if ins in vec:
                             self.tp_inames[ins] = '_' + '_'.join(vec[1:])
-                    else:
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.tp_inames[ins] = '_' + vec[1]
+                    elif len(vec) == 1:
                         ## This means that the prior is global (not instrument-dependent).
                         self.tp_inames[ins] = ''
+                    else:
+                        raise Exception('Prior for isotemp species is not properly defined: must be, e.g., isotemp, isotemp_inst or isotemp_inst1_inst2. Currently is '+pri)
                 
                 if pri[0:7].lower() == 'hazefac':
                     vec = pri.split('_')
-                    if len(vec) > 1:
-                        ## This means that the prior is instrument-dependent.
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
                         if ins in vec:
                             self.haze_inames[ins] = '_' + '_'.join(vec[1:])
-                    else:
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.haze_inames[ins] = '_' + vec[1]
+                    elif len(vec) == 1:
                         ## This means that the prior is global (not instrument-dependent).
                         self.haze_inames[ins] = ''
+                    else:
+                        raise Exception('Prior for hazefac species is not properly defined: must be, e.g., hazefac, hazefac_inst or hazefac_inst1_inst2. Currently is '+pri)
 
                 if pri[0:3].lower() == 'ctp':
                     vec = pri.split('_')
-                    if len(vec) > 1:
-                        ## This means that the prior is instrument-dependent.
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
                         if ins in vec:
                             self.ctp_inames[ins] = '_' + '_'.join(vec[1:])
-                    else:
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.ctp_inames[ins] = '_' + vec[1]
+                    elif len(vec) == 1:
                         ## This means that the prior is global (not instrument-dependent).
                         self.ctp_inames[ins] = ''
+                    else:
+                        raise Exception('Prior for ctp species is not properly defined: must be, e.g., ctp, ctp_inst or ctp_inst1_inst2. Currently is '+pri)
+
+                if pri[0:5].lower() == 'theta':
+                    vec = pri.split('_')
+                    theta_number = vec[0][5:]
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
+                        if ins in vec:
+                            self.lm_inames[theta_number + ins] = '_' + '_'.join(vec[1:])
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.lm_inames[theta_number + ins] = '_' + vec[1]
+                    else:
+                        raise Exception('Prior for theta species is not properly defined: must be, e.g., theta0_inst or theta0_inst1_inst2. Currently is '+pri)
         
         # Set the model-type to M(t):
         self.evaluate = self.evaluate_model
@@ -1422,7 +1489,7 @@ class model(object):
 
 
     def evaluate_model(self, instrument = None, parameter_values = None, all_samples = False, nsamples = 1000, return_samples = False, 
-                       resolution = None, return_err = False, alpha = 0.68):
+                       resolution = None, return_err = False, return_components = False, alpha = 0.68):
         # This function will generate the model spectrum for the given instrument and parameter values, and return the model spectrum. 
         # If all_samples is True, then it will use all samples to generate the model spectrum (parameter_values should be a dictionary with parameter names as keys and their corresponding samples as values). 
         # If return_samples is True, then it will also return models created for each samples
@@ -1434,6 +1501,9 @@ class model(object):
         ##.  First if statement: if parameter_values are given then we will generate the model spectrum for those parameter values.
         ##.        else statement: if parameter_values are not given, the model spectrum is generated for the posteriors
         if parameter_values is not None:
+            ## If return components is True, we will store the individual components of the model spectrum in the components dictionary.
+            if return_components:
+                components = {}
             ## Generate the model spectrum for the given parameter values.
             #### ---- parameter_values can be np.arrays (i.e., samples) or single values. 
             parameter_values = self.internal_parameter_names(parameter_values)
@@ -1465,6 +1535,12 @@ class model(object):
                             nsamples,
                             len( self.data.depth[instrument] )
                         ])
+
+                    ## For linear and non-linear models
+                    if return_components:
+                        lm_samples = np.zeros([ nsamples, len( self.data.depth[instrument] ) ])
+                        nlm_samples = np.zeros([ nsamples, len( self.data.depth[instrument] ) ])
+
                 else:
                     ## If resolution is provided, then we generate models at those resolutions
                     ### Currently, this means that the default resolution at which the model is created.
@@ -1479,6 +1555,10 @@ class model(object):
                             nsamples,
                             len( self.model_spec[instrument]['spectrum'] )
                         ])
+
+                    if return_components:
+                        lm_samples = np.zeros([ nsamples, len( self.model_spec[instrument]['spectrum'] ) ])
+                        nlm_samples = np.zeros([ nsamples, len( self.model_spec[instrument]['spectrum'] ) ])
                     
                     ## Okay if the model resolution is not the same as the data resolution, then we also need to provide wavelengths
                     output_model_wavelengths = np.zeros( len( self.model_spec[instrument]['spectrum'] ) )
@@ -1497,6 +1577,9 @@ class model(object):
                         output_model_wavelengths = self.model_spec[instrument]['wavelength']
                     
                     output_model_samples[i,:] = self.model_spec[instrument]['deterministic']
+                    if return_components:
+                        lm_samples[i,:] = self.model_spec[instrument]['LM']
+                        nlm_samples[i,:] = self.model_spec[instrument]['NLM']
                 
                 # If return_error is on, return upper and lower sigma (alpha x 100% CI) of the model(s):
                 if return_err:
@@ -1509,6 +1592,10 @@ class model(object):
                             m_output_model[i], u_output_model[i], l_output_model[i] = get_quantiles(output_model_samples[:, i], alpha=alpha)
                 else:
                     output_model = np.nanmedian(output_model_samples, axis=0)
+
+                if return_components:
+                    components['LM'] = np.nanmedian(lm_samples, axis=0)
+                    components['NLM'] = np.nanmedian(nlm_samples, axis=0)
                     
             else:
                 ## This means that the parameter values are single values. We will generate the model spectrum for those values.
@@ -1519,6 +1606,9 @@ class model(object):
                     output_model_wavelengths = self.model_spec[instrument]['wavelength']
 
                 output_model = self.model_spec[instrument]['deterministic']
+                if return_components:
+                    components['LM'] = self.model_spec[instrument]['LM']
+                    components['NLM'] = self.model_spec[instrument]['NLM']
 
         else:
             ## We will use the posteriors to generate the model spectrum.
@@ -1526,48 +1616,96 @@ class model(object):
             if return_samples:
                 if return_err:
                     if resolution is None:
-                        output_model_samples, m_output_model, u_output_model, l_output_model = x
+                        if return_components:
+                            output_model_samples, m_output_model, u_output_model, l_output_model, components = x
+                        else:
+                            output_model_samples, m_output_model, u_output_model, l_output_model = x
                     else:
-                        output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths = x
+                        if return_components:
+                            output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths, components = x
+                        else:
+                            output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths = x
                 else:
                     if resolution is None:
-                        output_model_samples, output_model = x
+                        if return_components:
+                            output_model_samples, output_model, components = x
+                        else:
+                            output_model_samples, output_model = x
                     else:
-                        output_model_samples, output_model, output_model_wavelengths = x
+                        if return_components:
+                            output_model_samples, output_model, output_model_wavelengths, components = x
+                        else:
+                            output_model_samples, output_model, output_model_wavelengths = x
             else:
                 if return_err:
                     if resolution is None:
-                        m_output_model, u_output_model, l_output_model = x
+                        if return_components:
+                            m_output_model, u_output_model, l_output_model, components = x
+                        else:
+                            m_output_model, u_output_model, l_output_model = x
                     else:
-                        m_output_model, u_output_model, l_output_model, output_model_wavelengths = x
+                        if return_components:
+                            m_output_model, u_output_model, l_output_model, output_model_wavelengths, components = x
+                        else:
+                            m_output_model, u_output_model, l_output_model, output_model_wavelengths = x
                 else:
                     if resolution is None:
-                        output_model = x
+                        if return_components:
+                            output_model, components = x
+                        else:
+                            output_model = x
                     else:
-                        output_model, output_model_wavelengths = x
+                        if return_components:
+                            output_model, output_model_wavelengths, components = x
+                        else:
+                            output_model, output_model_wavelengths = x
         
         if return_samples:
             if return_err:
                 if resolution is None:
-                    return output_model_samples, m_output_model, u_output_model, l_output_model
+                    if return_components:
+                        return output_model_samples, m_output_model, u_output_model, l_output_model, components
+                    else:
+                        return output_model_samples, m_output_model, u_output_model, l_output_model
                 else:
-                    return output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths
+                    if return_components:
+                        return output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths, components
+                    else:
+                        return output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths
             else:
                 if resolution is None:
-                    return output_model_samples, output_model
+                    if return_components:
+                        return output_model_samples, output_model, components
+                    else:
+                        return output_model_samples, output_model
                 else:
-                    return output_model_samples, output_model, output_model_wavelengths
+                    if return_components:
+                        return output_model_samples, output_model, output_model_wavelengths, components
+                    else:
+                        return output_model_samples, output_model, output_model_wavelengths
         else:
             if return_err:
                 if resolution is None:
-                    return m_output_model, u_output_model, l_output_model
+                    if return_components:
+                        return m_output_model, u_output_model, l_output_model, components
+                    else:
+                        return m_output_model, u_output_model, l_output_model
                 else:
-                    return m_output_model, u_output_model, l_output_model, output_model_wavelengths
+                    if return_components:
+                        return m_output_model, u_output_model, l_output_model, output_model_wavelengths, components
+                    else:
+                        return m_output_model, u_output_model, l_output_model, output_model_wavelengths
             else:
                 if resolution is None:
-                    return output_model
+                    if return_components:
+                        return output_model, components
+                    else:
+                        return output_model
                 else:
-                    return output_model, output_model_wavelengths
+                    if return_components:
+                        return output_model, output_model_wavelengths, components
+                    else:
+                        return output_model, output_model_wavelengths
 
     def generate_forward_models(self, parameter_values, rebin):
         ## Okay now we want to generate the forward model for each instrument using the parameter values.
@@ -1672,6 +1810,16 @@ class model(object):
                 else:
                     raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.data.code}")
 
+            else:
+                ## Okay so temperature profile is None, i.e., no planetary model, but we are still fitting a line or a non-linear func, or a GP func
+                ## We may need to access wavelength array in that case, so re-creating it!
+                if rebin:
+                    self.model_spec[ins]['wavelength'] = np.copy( self.data.wavelength[ins] )
+                else:
+                    ## Original high resolution, however, the atmospheric model hasn't run in this case, so we need to define a high-res wavelength grid by ourselves
+                    self.model_spec[ins]['wavelength'] = np.linspace( np.min(self.data.wavelength[ins]), np.max(self.data.wavelength[ins]), 1000 )
+                    self.model_spec[ins]['spectrum'] = np.zeros( 1000 )
+
             # We will ensure that offset and sigma_w parameters exist for this instrument, setting them to 0 if they are not provided.
             if 'offset_' + ins not in parameter_values.keys():
                 parameter_values['offset_' + ins ] = 0.0
@@ -1679,6 +1827,27 @@ class model(object):
                 parameter_values['sigma_w_' + ins ] = 0.0
             
             self.model_spec[ins]['deterministic'] = self.model_spec[ins]['spectrum'] + parameter_values['offset_' + ins ]
+
+            ## Checking if the instrument has a linear model (LM); and if it has, adding it to the deterministic model
+            if self.data_dict[ins]['has_LM']:
+                for j in range( self.data.LM_regressors[ins].shape[1] ):
+                    if rebin:
+                        ## Re-binning the model spectrum to the data resolution (i.e., no change in linear regressor, which is already at the data resolution)
+                        self.model_spec[ins]['LM'] = parameter_values['theta' + str(j) + self.lm_inames[str(j) + ins]] * self.data.LM_regressors[ins][:, j]
+                    else:
+                        ## No re-binning; i.e., the spectrum is at the original resolution, i.e., the linear regressors need to match this resolution
+                        ## We will interpolate the linear regressor to match the original resolution of the spectrum
+                        self.model_spec[ins]['LM'] = parameter_values['theta' + str(j) + self.lm_inames[str(j) + ins]] * np.interp(self.model_spec[ins]['wavelength'], self.data.wavelength[ins], self.data.LM_regressors[ins][:, j])
+                    self.model_spec[ins]['deterministic'] += self.model_spec[ins]['LM']
+
+            ## Checking if the instrument has a non-linear model (NLM); and if it has, adding it to the deterministic model
+            if self.data_dict[ins]['has_NLM']:
+                ### Same as above for rebinning
+                if rebin:
+                    self.model_spec[ins]['NLM'] = self.data.NLM[ins]['function'](self.data.NLM[ins]['regressors'], parameter_values)
+                else:
+                    self.model_spec[ins]['NLM'] = self.data.NLM[ins]['function'](np.interp(self.model_spec[ins]['wavelength'], self.data.wavelength[ins], self.data.NLM[ins]['regressors']), parameter_values)
+                self.model_spec[ins]['deterministic'] += self.model_spec[ins]['NLM']
 
             if 'FORWARD' not in self.data.mode.keys():
                 self.model_spec[ins]['variances'] = self.data.depth_err[ins] ** 2 + parameter_values['sigma_w_' + ins ] ** 2
