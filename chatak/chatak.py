@@ -13,6 +13,11 @@ try:
 except:
     print('Warning: UltraNest not found. UltraNest sampler cannot be used.')
 
+try:
+    import pymultinest
+except:
+    print('Warning: MultiNest (pymultinest) not found. MultiNest sampler cannot be used.')
+
 import dynesty
 from dynesty.utils import resample_equal
 import astropy.units as u
@@ -1116,6 +1121,10 @@ class fit(object):
                 weights = np.exp(results['logwt'] - results['logz'][-1])
                 posterior_samples = resample_equal(results.samples, weights)
 
+                # Get lnZ:
+                out['lnZ'] = results.logz[-1]
+                out['lnZerr'] = results.logzerr[-1]
+
             elif 'ultranest' in self.sampler:
 
                 # Match kwargs to possible ReactiveNestedSampler keywords. First, extract possible arguments of ReactiveNestedSampler:
@@ -1174,6 +1183,43 @@ class fit(object):
                 # Get lnZ:
                 out['lnZ'] = results['logz']
                 out['lnZerr'] = results['logzerr']
+
+            elif 'multinest' in self.sampler:
+                # As done for ultranest above, scan possible arguments for pymultinest.run:
+                args = pymultinest.run.__code__.co_varnames
+                mn_args = {}
+                # Define some standard ones:
+                mn_args['n_live_points'] = self.n_live_points
+                mn_args['max_modes'] = 100
+                mn_args['outputfiles_basename'] = self.out_folder + 'jomnest_'
+                mn_args['resume'] = False
+                mn_args['verbose'] = self.data.verbose
+                # Now extract arguments from kwargs:
+                for arg in args:
+                    if arg in kwargs:
+                        mn_args[arg] = kwargs[arg]
+                # Define the sampler:
+                pymultinest.run(self.loglike, self.prior_transform,
+                                self.data.nparams, **mn_args)
+
+                # Now, with the sampler defined, repeat the same as above for the pymultinest.Analyzer object:
+                args = pymultinest.Analyzer.__init__.__code__.co_varnames
+                mna_args = {}
+                # Define standard ones:
+                mna_args['outputfiles_basename'] = self.out_folder + 'jomnest_'
+                mna_args['n_params'] = self.data.nparams
+                # Load the ones from kwargs:
+                for arg in args:
+                    if arg in kwargs:
+                        mna_args[arg] = kwargs[arg]
+                # Run and get output:
+                output = pymultinest.Analyzer(**mna_args)
+                # Get out parameters: this matrix has (samples,n_params+1):
+                posterior_samples = output.get_equal_weighted_posterior(
+                )[:, :-1]
+                # Get INS lnZ:
+                out['lnZ'] = output.get_stats()['global evidence']
+                out['lnZerr'] = output.get_stats()['global evidence error']
             
 
             # Save posterior samples as outputted by Multinest/Dynesty:
@@ -1188,10 +1234,6 @@ class fit(object):
             for pcounter, pname in enumerate(self.paramnames):
                 self.posteriors[pname] = np.median(posterior_samples[:, pcounter])
                 out['posterior_samples'][pname] = posterior_samples[:, pcounter]
-
-            # Get lnZ:
-            out['lnZ'] = results.logz[-1]
-            out['lnZerr'] = results.logzerr[-1]
 
             if self.composition is not None:
                 out['composition_acceptance'] = self.composition_acceptance
