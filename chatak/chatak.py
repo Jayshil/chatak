@@ -13,6 +13,17 @@ try:
 except:
     print('Warning: UltraNest not found. UltraNest sampler cannot be used.')
 
+try:
+    import pymultinest
+except:
+    print('Warning: MultiNest (pymultinest) not found. MultiNest sampler cannot be used.')
+
+try:
+    import celerite2
+    from celerite2 import terms
+except ImportError:
+    print('Warning: celerite2 not found. celerite2 cannot be used for GP detrending.')
+
 import dynesty
 from dynesty.utils import resample_equal
 import astropy.units as u
@@ -20,88 +31,103 @@ import astropy.constants as con
 from tqdm import tqdm
 import pickle
 import os
+import warnings
 import multiprocessing
 from .utils import *
+from . import composition
 
 log2pi = np.log(2. * np.pi)  # ln(2*pi)
 
 class load(object):
+    ## Model settings that are saved in (and restored from) setup.txt. A value of None means "use the default".
+    _setup_defaults = {
+        'pressure_range': [-6, 2],
+        'pressure_points': 100,
+        'wavelength_range': None,
+        'filling_species': {},
+        'filling_line': [],
+        'cia': [],
+        'rayleigh_species': [],
+        'code': 'petit',
+        'petit_vmr': False,
+        'matern_eps': 0.01,
+    }
+
     def __init__(self, wavelength=None, depth=None, depth_err=None, wav_band=None, res_func=None, priors=None, mode=None,\
-                 pressure_range=[-6, 2], pressure_points=100, wavelength_range=None, filling_species={}, filling_line=[],\
-                 cia=[], rayleigh_species=[], resolution='c-k', code='petit', petit_vmr=False, pout=None, pin=None, verbose=False):
+                 pressure_range=None, pressure_points=None, wavelength_range=None, filling_species=None, filling_line=None,\
+                 cia=None, rayleigh_species=None, resolution='c-k', code=None, petit_vmr=None, LM_regressors=None, GP_regressors=None,\
+                 NLM=None, pout=None, pin=None, matern_eps=None, verbose=False):
         # Normal runs save wavelength-space inputs and per-instrument modes.
         # Forward runs only need priors and output location.
+        # Model settings (pressure grid, filling/CIA/Rayleigh species, etc.) are saved in setup.txt for every run;
+        # when pin is provided, they are restored from there.
+        passed_setup = {
+            'pressure_range': pressure_range,
+            'pressure_points': pressure_points,
+            'wavelength_range': wavelength_range,
+            'filling_species': filling_species,
+            'filling_line': filling_line,
+            'cia': cia,
+            'rayleigh_species': rayleigh_species,
+            'code': code,
+            'petit_vmr': petit_vmr,
+            'matern_eps': matern_eps,
+        }
+
         self.wavelength = wavelength
         self.depth = depth
         self.depth_err = depth_err
         self.wav_band = wav_band
         self.res_func = res_func
         self.priors = priors
+        self.LM_regressors = LM_regressors
+        self.GP_regressors = GP_regressors
+        self.NLM = NLM
         self.pout = pout
         self.pin = pin
         self.mode = mode
         self.instruments = []
         self.resolution = resolution
 
-        if self.pout[-1] != '/':
+        if self.pout is not None and self.pout[-1] != '/':
             self.pout = self.pout + '/'
 
-        ## Wavelength range to consider for the modeling. This should be a list or tuple with two elements: [wav_min, wav_max] in microns.
-        ## ONLY used in case of forward models: in case of retrievals, the wavelength range is _ALWAYS_ determined by the data.
-        self.wavelength_range = wavelength_range
-
-        ## Pressure range and resolution (in termns of number of points) to create pressure grid to generate models.
-        ## Pressure range is in log10(P) where P is in bar. The pressure grid will be created using np.logspace(pressure_range[0], pressure_range[1], pressure_points).
-        self.pressure_range = pressure_range
-        self.pressure_points = pressure_points
-
-        ## petitRADTRANS uses mass fractions instead of volume-mixing-ratios. So, by default, the abundances provided by the user
-        ## in case of petit=True, would be assumed to be mass fractions. However, the user can alternatively provide volume-mixing-ratios and 
-        ## set petit_vmr=True. In that case, the abundances will be converted to mass fractions using the mean molecular weight of the atmosphere calculated from the provided abundances.
-        self.petit_vmr = petit_vmr
-        
-        # CIA (collision-induced absorption) opacities to include in the modeling. 
-        # This should be a list of strings corresponding to the CIA species available in the opacity files (e.g., 'H2--H2', 'H2--He').
-        # I think this is only used for petitRADTRANS, but we can keep it as a general input for now.
-        self.cia = cia
-
-        # Rayleigh scattering species to include in the modeling.
-        # This should be a list of strings corresponding to the Rayleigh scattering species available in the opacity files (e.g., 'H2', 'He').
-        # I think this is only used for petitRADTRANS, but we can keep it as a general input for now.
-        self.rayleigh_species = rayleigh_species
-
-        # Filling species to include in the modeling.
-        # This should be a dictionary where the keys are the species names and the values are their corresponding weights.
-        self.filling_species = filling_species
-
-        # Whether a given filling species should be included as a line species in the modeling.
-        # This should be a list of strings corresponding to the filling species that should be treated as line species.
-        self.filling_line = filling_line
-
-        # The code to generate forward models; currently only petitRADTRANS is supported.
-        # Use petit for petitRADTRANS and poseidon for POSEIDON (POSEIDON support is planned but not yet implemented).
-        self.code = code
+        ## Setting the above model settings (with their defaults if not provided).
+        for key, value in passed_setup.items():
+            if value is None:
+                value = self._setup_defaults[key]
+                # Copy mutable defaults so that instances do not share them.
+                value = type(value)(value) if isinstance(value, (list, dict)) else value
+            setattr(self, key, value)
 
         self._spectrum_file = 'spectrum_data.txt'
         self._response_file = 'response_data.txt'
         self._priors_file = 'priors.txt'
+        self._setup_file = 'setup.txt'
+        self._lm_file = 'lm.txt'
+        self._gp_file = 'gp.txt'
+        self._nlm_file = 'nlm.txt'
+        self._nlm_func_file = 'nlm_functions.pkl'
         self.verbose = verbose
 
         if self.pin is not None:
             # Rerun mode: restore everything from the saved files.
-            provided = [wavelength, depth, depth_err, wav_band, res_func, priors, pout, mode]
+            provided = [wavelength, depth, depth_err, wav_band, res_func, priors, pout, mode, LM_regressors, GP_regressors, NLM]
             if any(value is not None for value in provided):
-                raise ValueError('When pin is provided, do not pass wavelength, depth, depth_err, wav_band, res_func, priors, pout, or mode.')
+                raise ValueError('When pin is provided, do not pass wavelength, depth, depth_err, wav_band, res_func, priors, pout, mode, LM_regressors, GP_regressors, or NLM.')
             if resolution != 'c-k' and resolution is not None:
                 raise ValueError('When pin is provided, do not pass resolution explicitly; it will be restored from disk.')
-            self.read()
+            self.read(passed_setup)
             if self.pout is None:
-                self.pout = self.pin
+                self.pout = self.pin if self.pin[-1] == '/' else self.pin + '/'
             if isinstance(self.mode, str):
                 self.mode = self._normalize_mode(self.mode, self.instruments)
             if isinstance(self.resolution, (str, int, np.integer)):
                 self.resolution = self._normalize_resolution(self.resolution, self.instruments)
+            self._init_composition()
             self.datadict_preparation()
+            self._set_wavelength_ranges()
+            self.init_models()
             return
 
         if self.mode == 'forward-transmission' or self.mode == 'forward-emission':
@@ -111,6 +137,9 @@ class load(object):
             if self.priors is None or self.pout is None:
                 raise ValueError('Forward mode requires priors and pout.')
             self._validate_priors()
+            self._init_composition()
+            if self.composition is not None:
+                raise ValueError('clr/dirichlet priors are only for retrievals; for forward models, provide fixed abundances (VMRs with petit_vmr=True).')
             if not os.path.exists(self.pout):
                 os.makedirs(self.pout)
             self.instruments = ['FORWARD']
@@ -147,6 +176,7 @@ class load(object):
         if any(value is None for value in self.resolution.values()):
             raise ValueError('resolution must be provided for all instruments in normal runs.')
         self._validate_inputs()
+        self._init_composition()
         self.instruments = sorted(self.wavelength.keys())
 
         if not os.path.exists(self.pout):
@@ -154,14 +184,24 @@ class load(object):
 
         self.save()
         self.datadict_preparation()
+        self._set_wavelength_ranges()
 
+        # Initialize the models
+        self.init_models()
+
+    def _set_wavelength_ranges(self):
         ## Calculating the wavelength ranges for each instrument and saving them in the data dictionary.
         for ins in self.instruments:
             self.data_dict[ins]['wav_min'] = np.min(self.wavelength[ins]) - ( 1.2 * np.median( np.diff( self.wavelength[ins] ) ) )
             self.data_dict[ins]['wav_max'] = np.max(self.wavelength[ins]) + ( 1.2 * np.median( np.diff( self.wavelength[ins] ) ) )
 
-        # Initialize the models
-        self.init_models()
+    def _init_composition(self):
+        ## Detect composition (clr/dirichlet, with optional metal fraction) priors on the line species and validate them.
+        ## self.composition is None if no such priors are given.
+        self.composition = composition.composition_from_priors(self.priors, filling_species=self.filling_species,\
+                                                               filling_line=self.filling_line, petit_vmr=self.petit_vmr)
+        if self.composition is not None and self.verbose:
+            print(f"Using {self.composition['scheme']} composition priors on {self.composition['species']} with background {self.composition['background']}.")
 
     def _normalize_mode(self, mode, instrument_keys):
         # Allow either a single legacy mode string or a per-instrument mode dict.
@@ -263,6 +303,58 @@ class load(object):
             raise ValueError('wav_band and res_func are required for all instruments with spectrum data.')
 
         self._validate_priors()
+        self._validate_regressors()
+
+    def _validate_regressors(self):
+        # Validate the optional LM_regressors / GP_regressors / NLM inputs. Each may be provided
+        # for only a subset of the instruments. Uses the wavelength keys (not self.instruments,
+        # which is still empty when _validate_inputs runs on a new run).
+        spec_keys = set(self.wavelength.keys())
+
+        def _check_keys(name, mapping):
+            if not isinstance(mapping, dict):
+                raise TypeError(f'{name} must be a dict with instrument names as keys.')
+            unknown = set(mapping.keys()) - spec_keys
+            if unknown:
+                raise ValueError(f'{name} has unknown instrument keys: {", ".join(sorted(unknown))}.')
+
+        if self.LM_regressors:
+            _check_keys('LM_regressors', self.LM_regressors)
+            for ins, arr in self.LM_regressors.items():
+                a = np.asarray(arr, dtype=float)
+                if a.ndim != 2:
+                    raise ValueError(f'LM_regressors for instrument {ins} must be 2D (len(wavelength), N).')
+                if a.shape[0] != len(self.wavelength[ins]):
+                    raise ValueError(f'LM_regressors for instrument {ins} must have {len(self.wavelength[ins])} rows (one per wavelength).')
+                n = a.shape[1]
+                if n < 1:
+                    raise ValueError(f'LM_regressors for instrument {ins} must have at least one column.')
+                # Require a theta prior per regressor column: theta0_<ins> ... theta{N-1}_<ins>.
+                missing = [f'theta{k}_{ins}' for k in range(n) if f'theta{k}_{ins}' not in self.priors]
+                if missing:
+                    raise ValueError(f'Missing priors for LM_regressors of instrument {ins}: {", ".join(missing)}.')
+
+        if self.GP_regressors:
+            _check_keys('GP_regressors', self.GP_regressors)
+            for ins, arr in self.GP_regressors.items():
+                a = np.asarray(arr, dtype=float)
+                if a.ndim != 1:
+                    raise ValueError(f'GP_regressors for instrument {ins} must be 1D.')
+                if len(a) != len(self.wavelength[ins]):
+                    raise ValueError(f'GP_regressors for instrument {ins} must have the same length as its wavelength array.')
+
+        if self.NLM:
+            _check_keys('NLM', self.NLM)
+            for ins, entry in self.NLM.items():
+                if not isinstance(entry, dict) or set(entry.keys()) != {'regressors', 'function'}:
+                    raise ValueError(f"NLM for instrument {ins} must be a dict with keys 'regressors' and 'function'.")
+                a = np.asarray(entry['regressors'], dtype=float)
+                if a.ndim != 1:
+                    raise ValueError(f'NLM regressors for instrument {ins} must be 1D.')
+                if len(a) != len(self.wavelength[ins]):
+                    raise ValueError(f'NLM regressors for instrument {ins} must have the same length as its wavelength array.')
+                if not callable(entry['function']):
+                    raise TypeError(f'NLM function for instrument {ins} must be callable.')
 
     def _write_multicolumn_txt(self, filename, rows, header):
         # Write ASCII tables with a single commented header line.
@@ -287,6 +379,40 @@ class load(object):
                 rows.append(cols)
         return rows
 
+    def _import_function_pickler(self):
+        # NLM stores an arbitrary Python function per instrument; plain pickle only stores a
+        # module+qualname reference, so we use cloudpickle/dill (which serialize by value) to
+        # survive re-runs where the function was defined in a script. Imported lazily, like the
+        # other optional dependencies (petitRADTRANS, ultranest).
+        try:
+            import cloudpickle as pickler
+        except ImportError:
+            try:
+                import dill as pickler
+            except ImportError:
+                raise ImportError(
+                    'Saving/restoring NLM requires cloudpickle or dill (pip install cloudpickle).'
+                )
+        return pickler
+
+    def _read_regressor_rows(self, filename):
+        # Read a wavelength/instrument/regressors table where the number of regressor columns
+        # may differ between instruments (used by lm.txt). Returns a list of
+        # (wavelength, instrument, [regressor floats]) tuples, skipping blank/comment lines.
+        rows = []
+        with open(filename, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                cols = line.split()
+                if len(cols) < 3:
+                    raise ValueError(
+                        f'File {filename} has malformed line with {len(cols)} columns; expected at least 3.'
+                    )
+                rows.append((float(cols[0]), cols[1], [float(c) for c in cols[2:]]))
+        return rows
+
     def save(self):
         # Save priors for every run; normal runs also save spectra and responses.
         if self.pout is None:
@@ -303,7 +429,15 @@ class load(object):
             for param, value in self.priors.items():
                 distribution = value['distribution']
                 hyperparameters = value['hyperparameters']
-                f.write(f'{param:<{param_width}} {distribution:<{dist_width}} {repr(hyperparameters)}\n')
+                f.write(f'{param:<{param_width}} {distribution:<{dist_width}} {repr(to_builtin(hyperparameters))}\n')
+
+        # Save model settings (one "key value" line per setting) so that pin reruns do not need them again.
+        setup_path = os.path.join(self.pout, self._setup_file)
+        key_width = max(len(key) for key in self._setup_defaults.keys())
+        with open(setup_path, 'w') as f:
+            f.write(f'# {"setting":<{key_width}} value\n')
+            for key in self._setup_defaults.keys():
+                f.write(f'{key:<{key_width}} {repr(to_builtin(getattr(self, key)))}\n')
 
         if 'FORWARD' in self.mode.keys():
             return
@@ -342,8 +476,59 @@ class load(object):
             '# wav_band_micron response_function instrument',
         )
 
-    def read(self):
-        # Restore saved priors for every run; spectrum and response files are optional in forward mode.
+        self._save_regressors()
+
+    def _save_regressors(self):
+        # Persist the optional LM_regressors / GP_regressors / NLM inputs (normal runs only;
+        # save() returns before this for FORWARD runs). Each may cover only a subset of
+        # instruments, so only the provided instruments are written.
+        if self.LM_regressors:
+            lm_rows = []
+            for ins in self.LM_regressors:
+                wav = np.asarray(self.wavelength[ins], dtype=float)
+                reg = np.asarray(self.LM_regressors[ins], dtype=float)
+                for i in range(len(wav)):
+                    values = ' '.join(f'{v:.16e}' for v in reg[i])
+                    lm_rows.append(f'{wav[i]:.16e} {ins} {values}')
+            self._write_multicolumn_txt(
+                os.path.join(self.pout, self._lm_file),
+                lm_rows,
+                '# wavelength_micron instrument theta_regressors(N_columns_vary_per_instrument)',
+            )
+
+        if self.GP_regressors:
+            gp_rows = []
+            for ins in self.GP_regressors:
+                wav = np.asarray(self.wavelength[ins], dtype=float)
+                reg = np.asarray(self.GP_regressors[ins], dtype=float)
+                for i in range(len(wav)):
+                    gp_rows.append(f'{wav[i]:.16e} {ins} {reg[i]:.16e}')
+            self._write_multicolumn_txt(
+                os.path.join(self.pout, self._gp_file),
+                gp_rows,
+                '# wavelength_micron instrument gp_regressor',
+            )
+
+        if self.NLM:
+            nlm_rows = []
+            functions = {}
+            for ins in self.NLM:
+                wav = np.asarray(self.wavelength[ins], dtype=float)
+                reg = np.asarray(self.NLM[ins]['regressors'], dtype=float)
+                for i in range(len(wav)):
+                    nlm_rows.append(f'{wav[i]:.16e} {ins} {reg[i]:.16e}')
+                functions[ins] = self.NLM[ins]['function']
+            self._write_multicolumn_txt(
+                os.path.join(self.pout, self._nlm_file),
+                nlm_rows,
+                '# wavelength_micron instrument nlm_regressor',
+            )
+            pickler = self._import_function_pickler()
+            with open(os.path.join(self.pout, self._nlm_func_file), 'wb') as f:
+                pickler.dump(functions, f)
+
+    def read(self, passed_setup=None):
+        # Restore saved priors and model settings for every run; spectrum and response files are optional in forward mode.
         if self.pin is None:
             raise ValueError('pin must be provided to read saved data.')
         if not os.path.isdir(self.pin):
@@ -369,6 +554,27 @@ class load(object):
                     raise ValueError(f'Could not parse hyperparameters for {param}: {hyperparameters_text}') from exc
                 priors[param] = {'distribution': distribution, 'hyperparameters': hyperparameters}
         self.priors = priors
+
+        # Restore model settings; older runs without setup.txt keep the settings passed to load.
+        setup_path = os.path.join(self.pin, self._setup_file)
+        if os.path.exists(setup_path):
+            if passed_setup is not None:
+                passed = [key for key, value in passed_setup.items() if value is not None]
+                if len(passed) > 0:
+                    raise ValueError(f'When pin is provided, do not pass {", ".join(passed)}; they will be restored from {setup_path}.')
+            with open(setup_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parts = line.split(None, 1)
+                    if len(parts) != 2 or parts[0] not in self._setup_defaults:
+                        raise ValueError(f'Invalid setup line: {line}')
+                    key, value_text = parts
+                    try:
+                        setattr(self, key, ast.literal_eval(value_text))
+                    except (ValueError, SyntaxError) as exc:
+                        raise ValueError(f'Could not parse setting {key}: {value_text}') from exc
 
         spectrum_path = os.path.join(self.pin, self._spectrum_file)
         response_path = os.path.join(self.pin, self._response_file)
@@ -422,7 +628,51 @@ class load(object):
         self.wav_band = {k: np.asarray(v, dtype=float) for k, v in wav_band.items()}
         self.res_func = {k: np.asarray(v, dtype=float) for k, v in res_func.items()}
 
+        self._read_regressors()
+
         self._validate_inputs()
+
+    def _read_regressors(self):
+        # Restore the optional LM_regressors / GP_regressors / NLM inputs from pin. Each file is
+        # optional (older runs, or runs without regressors); the attribute stays None when absent.
+        lm_path = os.path.join(self.pin, self._lm_file)
+        if os.path.exists(lm_path):
+            lm_rows = self._read_regressor_rows(lm_path)
+            lm = {}
+            for wav, ins, values in lm_rows:
+                if ins not in lm:
+                    lm[ins] = []
+                elif len(values) != len(lm[ins][0]):
+                    raise ValueError(f'Inconsistent number of LM regressor columns for instrument {ins} in {lm_path}.')
+                lm[ins].append(values)
+            self.LM_regressors = {k: np.asarray(v, dtype=float) for k, v in lm.items()}
+
+        gp_path = os.path.join(self.pin, self._gp_file)
+        if os.path.exists(gp_path):
+            gp_rows = self._read_multicolumn_txt(gp_path, expected_cols=3)
+            gp = {}
+            for wav, ins, value in gp_rows:
+                gp.setdefault(ins, []).append(float(value))
+            self.GP_regressors = {k: np.asarray(v, dtype=float) for k, v in gp.items()}
+
+        nlm_path = os.path.join(self.pin, self._nlm_file)
+        if os.path.exists(nlm_path):
+            func_path = os.path.join(self.pin, self._nlm_func_file)
+            if not os.path.exists(func_path):
+                raise FileNotFoundError(f'Missing saved NLM functions file: {func_path}')
+            pickler = self._import_function_pickler()
+            with open(func_path, 'rb') as f:
+                functions = pickler.load(f)
+            nlm_rows = self._read_multicolumn_txt(nlm_path, expected_cols=3)
+            regressors = {}
+            for wav, ins, value in nlm_rows:
+                regressors.setdefault(ins, []).append(float(value))
+            nlm = {}
+            for ins, reg in regressors.items():
+                if ins not in functions:
+                    raise ValueError(f'Missing saved NLM function for instrument {ins} in {func_path}.')
+                nlm[ins] = {'regressors': np.asarray(reg, dtype=float), 'function': functions[ins]}
+            self.NLM = nlm
 
     def _parse_resolution_value(self, value):
         # Try to restore integer resolutions, otherwise keep the original string label.
@@ -443,11 +693,18 @@ class load(object):
             
             ### Listing different names of the fitting and set them False by default.
             ### We will set them True depending on the priors.
-            self.data_dict[ self.instruments[i] ]['petitIsoTrans'] = False
+            #### Flags for transmission of emission fitting with petitRADTRANS (determined by data.code and data.mode)
+            self.data_dict[ self.instruments[i] ]['petitTrans'] = False
+            self.data_dict[ self.instruments[i] ]['petitEmiss'] = False
+
+            ## Temperature profile (function to create temperature profile)
+            self.data_dict[ self.instruments[i] ]['temperature_profile'] = None
+            self.data_dict[ self.instruments[i] ]['temperature_profile_func'] = None
 
             ### Array to save the line species which will be used in the modelling.
             self.data_dict[ self.instruments[i] ]['line_species'] = []
-            self.data_dict[ self.instruments[i] ]['logabundance'] = False
+            ### Line species whose abundances are given in log10 (i.e., line-log<species> priors).
+            self.data_dict[ self.instruments[i] ]['log_line_species'] = []
 
             ### Array to save the filling species which will be used in the modelling.
             self.data_dict[ self.instruments[i] ]['filling_species'] = []
@@ -464,6 +721,36 @@ class load(object):
             ### No longer needed: rayleigh scattering species will be provided directly in chatak.load, and we don't need to set priors for them.
             ### So, I am commenting out the rayleigh_species section.
             #self.data_dict[ self.instruments[i] ]['rayleigh_species'] = []
+
+            ### Setting up a boolean flag if the instrument has linear, GP, or non-linear regressors.
+            self.data_dict[ self.instruments[i] ]['has_LM'] = False
+            self.data_dict[ self.instruments[i] ]['has_GP'] = False
+            self.data_dict[ self.instruments[i] ]['has_NLM'] = False
+
+            ### If there is GP, then we also initialise the GP object for this instrument.
+            self.data_dict[ self.instruments[i] ]['noise_model'] = None#GaussianProcesses(self, instrument=self.instruments[i], matern_eps=self.matern_eps)
+
+        ## Checking if any of the instruments have linear, GP, or non-linear regressors and updating the flags accordingly.
+        for i in range( len(self.instruments) ):
+            if self.LM_regressors is not None:
+                if self.LM_regressors.get(self.instruments[i], None) is not None:
+                    self.data_dict[ self.instruments[i] ]['has_LM'] = True
+
+            if self.GP_regressors is not None:
+                if self.GP_regressors.get(self.instruments[i], None) is not None:
+                    self.data_dict[ self.instruments[i] ]['has_GP'] = True
+                    self.data_dict[ self.instruments[i] ]['noise_model'] = GaussianProcesses(self, instrument=self.instruments[i], matern_eps=self.matern_eps)
+                    if not self.data_dict[ self.instruments[i] ]['noise_model'].isInit:
+                        # Blame the user, although perhaps we could simply solve this as for the global modelling?:
+                        raise Exception(
+                            'INPUT ERROR: GP regressors for instrument ' +
+                            self.instruments[i] +
+                            ' use celerite2, and are not in ascending or descending order. Please, give the input in those orders --- it will not work othersie.'
+                        )
+            
+            if self.NLM is not None:
+                if self.NLM.get(self.instruments[i], None) is not None:
+                    self.data_dict[ self.instruments[i] ]['has_NLM'] = True
 
         # Let's see if the user wants to fit either for the planetary mass or the surface gravity.
         self.data_dict['mass_fit'] = False
@@ -495,16 +782,27 @@ class load(object):
                 if ( self.instruments[i] in fs.split('_') ) or ( len(fs.split('_')) == 1 ):
                     self.data_dict[ self.instruments[i] ]['filling_species'].append(fs + resolution)
                     self.data_dict[ self.instruments[i] ]['filling_species_weights'][fs + resolution] = self.filling_species[fs]
+
+            ## Setting flags for transmission and emission fitting
+            if self.code == 'petit':
+                if self.mode[self.instruments[i]] == 'transmission' or self.mode[self.instruments[i]] == 'forward-transmission':
+                    self.data_dict[ self.instruments[i] ]['petitTrans'] = True
+                    if self.verbose:
+                        print(f"Setting petitRADTRANS transmission fitting for instrument {self.instruments[i]}.")
+                elif self.mode[self.instruments[i]] == 'emission' or self.mode[self.instruments[i]] == 'forward-emission':
+                    self.data_dict[ self.instruments[i] ]['petitEmiss'] = True
+                    if self.verbose:
+                        print(f"Setting petitRADTRANS emission fitting for instrument {self.instruments[i]}.")
             
             for pri in self.priors.keys():
                 
                 if pri[0:7].lower() == 'isotemp':
                     if ( self.instruments[i] in pri.split('_') ) or ( len(pri.split('_')) == 1 ):
                         if self.code == 'petit':
-                            if self.mode[self.instruments[i]] == 'transmission' or self.mode[self.instruments[i]] == 'forward-transmission':
-                                self.data_dict[ self.instruments[i] ]['petitIsoTrans'] = True
-                                if self.verbose:
-                                    print(f"Setting petitRADTRANS isothermal transmission fitting for instrument {self.instruments[i]}.")
+                            self.data_dict[ self.instruments[i] ]['temperature_profile'] = 'isothermal'
+                            self.data_dict[ self.instruments[i] ]['temperature_profile_func'] = TP_isothermal
+                            if self.verbose:
+                                print(f"Setting petitRADTRANS isothermal transmission fitting for instrument {self.instruments[i]}.")
                         else:
                             raise NotImplementedError(f"Isothermal fitting is currently only implemented for petitRADTRANS. Unsupported code: {self.code}")
                         
@@ -513,7 +811,7 @@ class load(object):
                     if ( self.instruments[i] in pri.split('_') ) or ( len(pri.split('_')) == 1 ):
                         if pri.split('-')[1][0:3] == 'log':
                             self.data_dict[ self.instruments[i] ]['line_species'].append( pri.split('-')[1][3:] + resolution )
-                            self.data_dict[ self.instruments[i] ]['logabundance'] = True
+                            self.data_dict[ self.instruments[i] ]['log_line_species'].append( pri.split('-')[1][3:] + resolution )
                             if self.verbose:
                                 print(f"Adding line species {pri.split('-')[1][3:]} to instrument {self.instruments[i]} with log-abundance.")
                         else:
@@ -568,9 +866,9 @@ class load(object):
 
         # Warn (without breaking execution) if setups differ across instruments.
         if len(self.instruments) > 1:
-            fit_values = [self.data_dict[ins]['petitIsoTrans'] for ins in self.instruments]
+            fit_values = [self.data_dict[ins]['temperature_profile'] for ins in self.instruments]
             if len(set(fit_values)) > 1:
-                print('Warning: fitting type is different across instruments.')
+                print('Warning: temperature profile is different across instruments.')
 
             line_sets = [tuple(sorted(set(self.data_dict[ins]['line_species']))) for ins in self.instruments]
             if len(set(line_sets)) > 1:
@@ -587,17 +885,20 @@ class load(object):
     def init_models(self):
         self.models = {}
         for i in range( len( self.instruments ) ):
-            if self.code == 'petit':
-                self.models[ self.instruments[i] ] = SpectralModel(
-                                                                   pressures=np.logspace(self.pressure_range[0], self.pressure_range[1], self.pressure_points),
-                                                                   line_species=self.data_dict[ self.instruments[i] ]['line_species'],
-                                                                   rayleigh_species=self.rayleigh_species,
-                                                                   gas_continuum_contributors=self.cia,
-                                                                   wavelength_boundaries=[self.data_dict[ self.instruments[i] ]['wav_min'], self.data_dict[ self.instruments[i] ]['wav_max']],
-                                                                   line_opacity_mode=self.data_dict[ self.instruments[i] ]['opacity_mode']
-                                                                  )
-            else:
-                raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.code}")
+            if self.data_dict[ self.instruments[i] ]['temperature_profile'] is not None:
+                if self.code == 'petit':
+                    self.models[ self.instruments[i] ] = SpectralModel(
+                                                                    pressures=np.logspace(self.pressure_range[0], self.pressure_range[1], self.pressure_points),
+                                                                    line_species=self.data_dict[ self.instruments[i] ]['line_species'],
+                                                                    rayleigh_species=self.rayleigh_species,
+                                                                    gas_continuum_contributors=self.cia,
+                                                                    wavelength_boundaries=[self.data_dict[ self.instruments[i] ]['wav_min'], self.data_dict[ self.instruments[i] ]['wav_max']],
+                                                                    line_opacity_mode=self.data_dict[ self.instruments[i] ]['opacity_mode'],
+                                                                    ## Temperature profile function
+                                                                    model_functions_map={'temperatures': self.data_dict[ self.instruments[i] ]['temperature_profile_func']}
+                                                                    )
+                else:
+                    raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.code}")
     
     def generate_forward_models(self, save=True, **kwargs):
         # This function will generate forward models using model class.
@@ -669,13 +970,26 @@ class fit(object):
         self.model_parameters = list(self.data.priors.keys())
         self.paramnames = []
         nfree = 0
+
+        # With composition (clr/dirichlet) priors, one of the listed species is computed from the others (if any), so it is not sampled.
+        self.composition = self.data.composition
+        implicit_prior = self.composition['implicit_prior'] if self.composition is not None else None
+
         for pname in self.model_parameters:
-            if self.data.priors[pname]['distribution'] == 'fixed':
+            if self.data.priors[pname]['distribution'].lower() == 'fixed':
                 self.posteriors[pname] = self.data.priors[pname]['hyperparameters']
+            elif pname == implicit_prior:
+                self.posteriors[pname] = None
             else:
                 self.posteriors[pname] = 0.
                 self.paramnames.append(pname)
                 nfree += 1
+
+        # For CLR priors, the prior is truncated to the part of the box that gives valid compositions; lnZ carries a factor equal to the acceptance fraction.
+        if self.composition is not None:
+            self.composition_acceptance = composition.acceptance_fraction(self.composition)
+            print(f"Composition prior ({self.composition['scheme']}, {self.composition['n']} components on the simplex): "
+                  f"acceptance fraction = {self.composition_acceptance:.4f}")
 
         self.transformed_priors = np.zeros(nfree)
 
@@ -685,6 +999,7 @@ class fit(object):
         # This avoids having to keep track of the prior distribution on each of the iterations. This is only useful for
         # nested samplers:
         self.transform_prior = {}
+        self.transform_hyperparameters = {}
         self.set_prior_transform()
 
         self.model = model(self.data, convolve=self.convolve, resolving_power=self.resolving_power)
@@ -718,7 +1033,7 @@ class fit(object):
 
                     d_args = {}
                     d_args['bound'] = 'multi'
-                    d_args['sample'] = 'rwalk'
+                    d_args['sample'] = 'rwalk' if nfree < 20 else 'rslice'
                     d_args['nlive'] = self.n_live_points
                     # Match them with kwargs (kwargs take preference):
                     for arg in args:
@@ -770,7 +1085,7 @@ class fit(object):
 
                     d_args = {}
                     d_args['bound'] = 'multi'
-                    d_args['sample'] = 'rwalk'
+                    d_args['sample'] = 'rwalk' if nfree < 20 else 'rslice'
                     d_args['nlive'] = self.n_live_points
                     # Match them with kwargs:
                     for arg in args:
@@ -824,6 +1139,10 @@ class fit(object):
                 # Get weighted posterior:
                 weights = np.exp(results['logwt'] - results['logz'][-1])
                 posterior_samples = resample_equal(results.samples, weights)
+
+                # Get lnZ:
+                out['lnZ'] = results.logz[-1]
+                out['lnZerr'] = results.logzerr[-1]
 
             elif 'ultranest' in self.sampler:
 
@@ -883,6 +1202,43 @@ class fit(object):
                 # Get lnZ:
                 out['lnZ'] = results['logz']
                 out['lnZerr'] = results['logzerr']
+
+            elif 'multinest' in self.sampler:
+                # As done for ultranest above, scan possible arguments for pymultinest.run:
+                args = pymultinest.run.__code__.co_varnames
+                mn_args = {}
+                # Define some standard ones:
+                mn_args['n_live_points'] = self.n_live_points
+                mn_args['max_modes'] = 100
+                mn_args['outputfiles_basename'] = self.out_folder + 'jomnest_'
+                mn_args['resume'] = False
+                mn_args['verbose'] = self.data.verbose
+                # Now extract arguments from kwargs:
+                for arg in args:
+                    if arg in kwargs:
+                        mn_args[arg] = kwargs[arg]
+                # Define the sampler:
+                pymultinest.run(self.loglike, self.prior_transform,
+                                self.data.nparams, **mn_args)
+
+                # Now, with the sampler defined, repeat the same as above for the pymultinest.Analyzer object:
+                args = pymultinest.Analyzer.__init__.__code__.co_varnames
+                mna_args = {}
+                # Define standard ones:
+                mna_args['outputfiles_basename'] = self.out_folder + 'jomnest_'
+                mna_args['n_params'] = self.data.nparams
+                # Load the ones from kwargs:
+                for arg in args:
+                    if arg in kwargs:
+                        mna_args[arg] = kwargs[arg]
+                # Run and get output:
+                output = pymultinest.Analyzer(**mna_args)
+                # Get out parameters: this matrix has (samples,n_params+1):
+                posterior_samples = output.get_equal_weighted_posterior(
+                )[:, :-1]
+                # Get INS lnZ:
+                out['lnZ'] = output.get_stats()['global evidence']
+                out['lnZerr'] = output.get_stats()['global evidence error']
             
 
             # Save posterior samples as outputted by Multinest/Dynesty:
@@ -894,16 +1250,17 @@ class fit(object):
             for i in tqdm(range(posterior_samples.shape[0])):
                 out['posterior_samples']['loglike'][i] = self.loglike(posterior_samples[i, :])
 
-            pcounter = 0
-            for pname in self.model_parameters:
-                if self.data.priors[pname]['distribution'] != 'fixed':
-                    self.posteriors[pname] = np.median(posterior_samples[:, pcounter])
-                    out['posterior_samples'][pname] = posterior_samples[:, pcounter]
-                    pcounter += 1
+            for pcounter, pname in enumerate(self.paramnames):
+                self.posteriors[pname] = np.median(posterior_samples[:, pcounter])
+                out['posterior_samples'][pname] = posterior_samples[:, pcounter]
 
-            # Get lnZ:
-            out['lnZ'] = results.logz[-1]
-            out['lnZerr'] = results.logzerr[-1]
+            if self.composition is not None:
+                out['composition_acceptance'] = self.composition_acceptance
+                # Derived quantities (abundances, mean molar mass, mass fractions, metal fraction, Z) for each posterior sample:
+                out['derived_samples'] = self.composition_derived_samples(out['posterior_samples'])
+                # Rename sampled composition parameters to what they are: xi-<species> (clr) or u-<species> (dirichlet)
+                out['posterior_samples'] = { self.composition['output_names'].get(pname, pname): value \
+                                             for pname, value in out['posterior_samples'].items() }
 
             pickle.dump(out, open(self.pout + self.sampler_prefix + 'posteriors.pkl', 'wb'))
 
@@ -911,6 +1268,8 @@ class fit(object):
             # If the sampler was already ran, then user really wants to extract outputs from previous fit:
             print('Detected ' + self.sampler + ' sampler output files --- extracting from ' + self.pout + self.sampler_prefix + 'posteriors.pkl')
             out = pickle.load( open( self.pout + self.sampler_prefix + 'posteriors.pkl', 'rb'))
+            if self.composition is not None and 'derived_samples' not in out.keys():
+                out['derived_samples'] = self.composition_derived_samples(self.model.internal_parameter_names(out['posterior_samples']))
 
         # Either fit done or extracted. If doesn't exist, create the posteriors.dat file:
         if self.pout is not None:
@@ -924,11 +1283,8 @@ class fit(object):
 
     def loglike(self, cube, ndim=None, nparams=None):
         # Evaluate the joint log-likelihood. For this, first extract all inputs:
-        pcounter = 0
-        for pname in self.model_parameters:
-            if self.data.priors[pname]['distribution'].lower() != 'fixed':
-                self.posteriors[pname] = cube[pcounter]
-                pcounter += 1
+        for pcounter, pname in enumerate(self.paramnames):
+            self.posteriors[pname] = cube[pcounter]
         # Initialize log-likelihood:
         log_likelihood = 0.0
 
@@ -936,7 +1292,7 @@ class fit(object):
         if self.data.wavelength is not None:
             self.model.generate(self.posteriors, True)
             if self.model.modelOK:
-                log_likelihood += self.model.get_loglikelihood()
+                log_likelihood += self.model.get_loglikelihood(self.posteriors)
             else:
                 return -1e101
         
@@ -950,9 +1306,20 @@ class fit(object):
         return log_likelihood
 
     def set_prior_transform(self):
-        for pname in self.model_parameters:
+        for pname in self.paramnames:
             dist_name = self.data.priors[pname]['distribution'].lower()
+            self.transform_hyperparameters[pname] = self.data.priors[pname]['hyperparameters']
             if dist_name != 'fixed':
+                if dist_name == 'clr':
+                    # CLR coordinates are uniform within the exact bounds for the number of components.
+                    self.transform_prior[pname] = transform_uniform
+                    self.transform_hyperparameters[pname] = self.composition['xi_bounds']
+                if dist_name == 'dirichlet':
+                    # Dirichlet priors sample the unit cube directly; the stick-breaking is done in the model.
+                    self.transform_prior[pname] = transform_uniform
+                    self.transform_hyperparameters[pname] = [0., 1.]
+                if dist_name == 'logituniform':
+                    self.transform_prior[pname] = transform_logituniform
                 if dist_name == 'uniform':
                     self.transform_prior[pname] = transform_uniform
                 if dist_name == 'normal':
@@ -970,14 +1337,22 @@ class fit(object):
 
     # Prior transform for nested samplers (this one spits the transformed priors from the unit cube):
     def prior_transform_r(self, cube):
-        pcounter = 0
         transformed_priors = np.copy(self.transformed_priors)
-        for pname in self.model_parameters:
-            if self.data.priors[pname]['distribution'].lower() != 'fixed':
-                transformed_priors[pcounter] = self.transform_prior[pname](cube[pcounter], \
-                                               self.data.priors[pname]['hyperparameters'])
-                pcounter += 1
+        for pcounter, pname in enumerate(self.paramnames):
+            transformed_priors[pcounter] = self.transform_prior[pname](cube[pcounter], \
+                                           self.transform_hyperparameters[pname])
         return transformed_priors
+
+    def composition_derived_samples(self, posterior_samples):
+        # Compute derived composition quantities for all posterior samples (keyed by prior names).
+        parameter_values = {}
+        for pname in self.model_parameters:
+            if self.data.priors[pname]['distribution'].lower() == 'fixed':
+                parameter_values[pname] = self.data.priors[pname]['hyperparameters']
+        parameter_values.update(posterior_samples)
+        theta = composition.theta_from_parameters(parameter_values, self.composition)
+        X, _ = composition.params_to_vmr(theta, self.composition)
+        return composition.derived_quantities(X, self.composition['X_min'], background=self.composition['background'])
 
 class model(object):
     def __init__(self, data, convolve=False, resolving_power=None):
@@ -992,6 +1367,10 @@ class model(object):
 
         self.modelOK = True
 
+        ## Composition (clr/dirichlet) priors, if any; the VMRs of the current model are saved in composition_vmr.
+        self.composition = self.data.composition
+        self.composition_vmr = None
+
         ## Convolution settings
         self.convolve = convolve
         self.resolving_power = resolving_power
@@ -1003,6 +1382,7 @@ class model(object):
         self.tp_inames = {}
         self.ctp_inames = {}
         self.haze_inames = {}
+        self.lm_inames = {}
 
         # Define a variable that will save the posterior samples:
         self.posteriors = None
@@ -1017,31 +1397,53 @@ class model(object):
                 self.model_spec[ins]['wavelength'] = np.zeros_like( self.data.depth[ins] )
                 self.model_spec[ins]['spectrum'] = np.zeros_like( self.data.depth[ins] )
                 self.model_spec[ins]['variances'] = np.zeros_like( self.data.depth_err[ins] )
+
+                self.model_spec[ins]['deterministic'] = np.zeros_like( self.data.depth[ins] )
+                self.model_spec[ins]['LM'] = np.zeros_like( self.data.depth[ins] )
+                self.model_spec[ins]['NLM'] = np.zeros_like( self.data.depth[ins] )
+                self.model_spec[ins]['GP'] = np.zeros_like( self.data.depth[ins] )
             else:
                 self.model_spec[ins]['wavelength'] = np.zeros( 1000 )  # Placeholder wavelength array for forward runs; actual wavelengths will depend on the forward model setup.
                 self.model_spec[ins]['spectrum'] = np.zeros( 1000 )  # Placeholder spectrum array for forward runs; actual values will be computed by the forward model.
                 self.model_spec[ins]['variances'] = np.zeros( 1000 )  # Placeholder variances array for forward runs; actual values will be computed by the forward model.
 
+                self.model_spec[ins]['deterministic'] = np.zeros( 1000 )
+                self.model_spec[ins]['LM'] = np.zeros( 1000 )
+                self.model_spec[ins]['NLM'] = np.zeros( 1000 )
+                self.model_spec[ins]['GP'] = np.zeros( 1000 )
+
             for pri in self.priors.keys():
                 if pri[0:4].lower() == 'line':
                     vec = pri.split('_')
-                    if len(vec) > 1:
-                        ## This means that the prior is instrument-dependent.
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
                         if ins in vec:
                             self.line_inames[ins] = '_' + '_'.join(vec[1:])
-                    else:
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.line_inames[ins] = '_' + vec[1]
+                    elif len(vec) == 1:
                         ## This means that the prior is global (not instrument-dependent).
                         self.line_inames[ins] = ''
+                    else:
+                        raise Exception('Prior for line species is not properly defined: must be, e.g., line-CO2, line-CO2_inst or line-CO2_inst1_inst2. Currently is '+pri)
                 
                 if pri[0:5].lower() == 'cloud':
                     vec = pri.split('_')
-                    if len(vec) > 1:
-                        ## This means that the prior is instrument-dependent.
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
                         if ins in vec:
                             self.cloud_inames[ins] = '_' + '_'.join(vec[1:])
-                    else:
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.cloud_inames[ins] = '_' + vec[1]
+                    elif len(vec) == 1:
                         ## This means that the prior is global (not instrument-dependent).
                         self.cloud_inames[ins] = ''
+                    else:
+                        raise Exception('Prior for cloud species is not properly defined: must be, e.g., cloud, cloud_inst or cloud_inst1_inst2. Currently is '+pri)
 
                 ### No longer needed as Rayleigh species are now provided differently.
                 #if pri[0:8].lower() == 'rayleigh':
@@ -1056,40 +1458,79 @@ class model(object):
 
                 if pri[0:7].lower() == 'isotemp':
                     vec = pri.split('_')
-                    if len(vec) > 1:
-                        ## This means that the prior is instrument-dependent.
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
                         if ins in vec:
                             self.tp_inames[ins] = '_' + '_'.join(vec[1:])
-                    else:
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.tp_inames[ins] = '_' + vec[1]
+                    elif len(vec) == 1:
                         ## This means that the prior is global (not instrument-dependent).
                         self.tp_inames[ins] = ''
+                    else:
+                        raise Exception('Prior for isotemp species is not properly defined: must be, e.g., isotemp, isotemp_inst or isotemp_inst1_inst2. Currently is '+pri)
                 
                 if pri[0:7].lower() == 'hazefac':
                     vec = pri.split('_')
-                    if len(vec) > 1:
-                        ## This means that the prior is instrument-dependent.
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
                         if ins in vec:
                             self.haze_inames[ins] = '_' + '_'.join(vec[1:])
-                    else:
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.haze_inames[ins] = '_' + vec[1]
+                    elif len(vec) == 1:
                         ## This means that the prior is global (not instrument-dependent).
                         self.haze_inames[ins] = ''
+                    else:
+                        raise Exception('Prior for hazefac species is not properly defined: must be, e.g., hazefac, hazefac_inst or hazefac_inst1_inst2. Currently is '+pri)
 
                 if pri[0:3].lower() == 'ctp':
                     vec = pri.split('_')
-                    if len(vec) > 1:
-                        ## This means that the prior is instrument-dependent.
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
                         if ins in vec:
                             self.ctp_inames[ins] = '_' + '_'.join(vec[1:])
-                    else:
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.ctp_inames[ins] = '_' + vec[1]
+                    elif len(vec) == 1:
                         ## This means that the prior is global (not instrument-dependent).
                         self.ctp_inames[ins] = ''
+                    else:
+                        raise Exception('Prior for ctp species is not properly defined: must be, e.g., ctp, ctp_inst or ctp_inst1_inst2. Currently is '+pri)
+
+                if pri[0:5].lower() == 'theta':
+                    vec = pri.split('_')
+                    theta_number = vec[0][5:]
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
+                        if ins in vec:
+                            self.lm_inames[theta_number + ins] = '_' + '_'.join(vec[1:])
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.lm_inames[theta_number + ins] = '_' + vec[1]
+                    else:
+                        raise Exception('Prior for theta species is not properly defined: must be, e.g., theta0_inst or theta0_inst1_inst2. Currently is '+pri)
         
         # Set the model-type to M(t):
         self.evaluate = self.evaluate_model
         self.generate = self.generate_forward_models
 
+    def internal_parameter_names(self, parameter_values):
+        ## Sampled composition parameters are saved as xi-<species>/u-<species> in the outputs; the model uses the prior names.
+        if self.composition is None:
+            return parameter_values
+        output2prior = { v: k for k, v in self.composition['output_names'].items() }
+        return { output2prior.get(pname, pname): value for pname, value in parameter_values.items() }
+
     def set_posterior_samples(self, posterior_samples):
-        self.posteriors = posterior_samples
+        self.posteriors = self.internal_parameter_names(posterior_samples)
         self.median_posterior_samples = {}
         
         for parameter in self.posteriors.keys():
@@ -1102,14 +1543,27 @@ class model(object):
         
         try:
             self.generate(self.median_posterior_samples, True)
+            if not self.modelOK:
+                print('Warning: the posterior median gives an invalid model (e.g., an invalid composition).')
         except:
             print(
                 'Warning: model evaluated at the posterior median did not compute properly.'
             )
 
+    def get_GP_plus_deterministic_model(self, parameter_values, instrument=None, Xpred=None):
+        if self.data_dict[instrument]['has_GP']:
+            self.data_dict[instrument]['noise_model'].update_GP(parameter_values)
+            if Xpred is None:
+                self.model_spec[instrument]['GP'] = self.data_dict[instrument]['noise_model'].GP.predict(y=self.residuals, t=self.data_dict[instrument]['noise_model'].X, return_cov=False)
+            else:
+                self.model_spec[instrument]['GP'] = self.data_dict[instrument]['noise_model'].GP.predict(y=self.residuals, t=Xpred, return_cov=False)
+            return self.model_spec[instrument]['deterministic'], self.model_spec[instrument]['GP'], self.model_spec[instrument]['deterministic'] + self.model_spec[instrument]['GP']
+        else:
+            return self.model_spec[instrument]['deterministic']
+
 
     def evaluate_model(self, instrument = None, parameter_values = None, all_samples = False, nsamples = 1000, return_samples = False, 
-                       resolution = None, return_err = False, alpha = 0.68):
+                       resolution = None, return_err = False, return_components = False, alpha = 0.68):
         # This function will generate the model spectrum for the given instrument and parameter values, and return the model spectrum. 
         # If all_samples is True, then it will use all samples to generate the model spectrum (parameter_values should be a dictionary with parameter names as keys and their corresponding samples as values). 
         # If return_samples is True, then it will also return models created for each samples
@@ -1121,8 +1575,12 @@ class model(object):
         ##.  First if statement: if parameter_values are given then we will generate the model spectrum for those parameter values.
         ##.        else statement: if parameter_values are not given, the model spectrum is generated for the posteriors
         if parameter_values is not None:
+            ## If return components is True, we will store the individual components of the model spectrum in the components dictionary.
+            if return_components:
+                components = {}
             ## Generate the model spectrum for the given parameter values.
             #### ---- parameter_values can be np.arrays (i.e., samples) or single values. 
+            parameter_values = self.internal_parameter_names(parameter_values)
             parameters = list(self.priors.keys())
             input_parameters = list(parameter_values.keys())
             if type(parameter_values[input_parameters[0]]) is np.ndarray:
@@ -1151,6 +1609,13 @@ class model(object):
                             nsamples,
                             len( self.data.depth[instrument] )
                         ])
+
+                    ## For linear and non-linear models
+                    if return_components:
+                        lm_samples = np.zeros([ nsamples, len( self.data.depth[instrument] ) ])
+                        nlm_samples = np.zeros([ nsamples, len( self.data.depth[instrument] ) ])
+                        gp_samples = np.zeros([ nsamples, len( self.data.depth[instrument] ) ])
+
                 else:
                     ## If resolution is provided, then we generate models at those resolutions
                     ### Currently, this means that the default resolution at which the model is created.
@@ -1165,6 +1630,11 @@ class model(object):
                             nsamples,
                             len( self.model_spec[instrument]['spectrum'] )
                         ])
+
+                    if return_components:
+                        lm_samples = np.zeros([ nsamples, len( self.model_spec[instrument]['spectrum'] ) ])
+                        nlm_samples = np.zeros([ nsamples, len( self.model_spec[instrument]['spectrum'] ) ])
+                        gp_samples = np.zeros([ nsamples, len( self.model_spec[instrument]['spectrum'] ) ])
                     
                     ## Okay if the model resolution is not the same as the data resolution, then we also need to provide wavelengths
                     output_model_wavelengths = np.zeros( len( self.model_spec[instrument]['spectrum'] ) )
@@ -1175,14 +1645,36 @@ class model(object):
                     for parameter in input_parameters:
                         # Populate the current parameter_values
                         current_parameter_values[parameter] = parameter_values[parameter][idx_samples[i]]
+
+                    ## If resolution is specified, i.e., we need models, including GP, at higher resolution.
+                    ## TO calculate the GP models at the higher resolution, we still need to calculate the residuals at the data resolution
+                    ## Which we can then use to predict the GP model at the higher resolution.
+                    if resolution is not None:
+                        self.generate_forward_models(current_parameter_values, rebin=True)
+                        self.residuals = self.data.depth[instrument] - self.model_spec[instrument]['deterministic']
                     
                     if resolution is None:
                         self.generate_forward_models(current_parameter_values, rebin=True)
+                        self.residuals = self.data.depth[instrument] - self.model_spec[instrument]['deterministic']
+                        if self.data_dict[instrument]['has_GP']:
+                            _, gp_model, _ = self.get_GP_plus_deterministic_model(current_parameter_values, instrument)
+                            if return_components:
+                                gp_samples[i,:] = gp_model
                     else:
                         self.generate_forward_models(current_parameter_values, rebin=False)
                         output_model_wavelengths = self.model_spec[instrument]['wavelength']
+                        ## Now if there is a GP model, we can calculate it at the higher resolution using the residuals
+                        if self.data_dict[instrument]['has_GP']:
+                            # In this case, we still need to calculate the GP regressor at the higher resolution, we will do this by interpolating the wavelength
+                            Xpred = np.interp(output_model_wavelengths, self.data.wavelength[instrument], self.data.GP_regressors[instrument])
+                            _, gp_model, _ = self.get_GP_plus_deterministic_model(current_parameter_values, instrument, Xpred=Xpred)
+                            if return_components:
+                                gp_samples[i,:] = gp_model
                     
-                    output_model_samples[i,:] = self.model_spec[instrument]['spectrum']
+                    output_model_samples[i,:] = self.model_spec[instrument]['deterministic'] + gp_model
+                    if return_components:
+                        lm_samples[i,:] = self.model_spec[instrument]['LM']
+                        nlm_samples[i,:] = self.model_spec[instrument]['NLM']
                 
                 # If return_error is on, return upper and lower sigma (alpha x 100% CI) of the model(s):
                 if return_err:
@@ -1192,19 +1684,30 @@ class model(object):
                     
                     ## Generating quantiles
                     for i in range(output_model_samples.shape[1]):
-                            m_output_model[i], u_output_model[i], l_output_model[i] = get_quantiles(output_model_samples[:, i], alpha=alpha)
+                        m_output_model[i], u_output_model[i], l_output_model[i] = get_quantiles(output_model_samples[:, i], alpha=alpha)
                 else:
                     output_model = np.nanmedian(output_model_samples, axis=0)
+
+                if return_components:
+                    components['LM'] = np.nanmedian(lm_samples, axis=0)
+                    components['NLM'] = np.nanmedian(nlm_samples, axis=0)
+                    components['GP'] = np.nanmedian(gp_samples, axis=0)
                     
             else:
                 ## This means that the parameter values are single values. We will generate the model spectrum for those values.
                 if resolution is None:
                     self.generate_forward_models(parameter_values, rebin=True)
+                    if self.data_dict[instrument]['has_GP']:
+                        _, gp_model, _ = self.get_GP_plus_deterministic_model(parameter_values, instrument=instrument)
                 else:
                     self.generate_forward_models(parameter_values, rebin=False)
                     output_model_wavelengths = self.model_spec[instrument]['wavelength']
 
-                output_model = self.model_spec[instrument]['spectrum']
+                output_model = self.model_spec[instrument]['deterministic'] + gp_model
+                if return_components:
+                    components['LM'] = self.model_spec[instrument]['LM']
+                    components['NLM'] = self.model_spec[instrument]['NLM']
+                    components['GP'] = gp_model
 
         else:
             ## We will use the posteriors to generate the model spectrum.
@@ -1212,48 +1715,96 @@ class model(object):
             if return_samples:
                 if return_err:
                     if resolution is None:
-                        output_model_samples, m_output_model, u_output_model, l_output_model = x
+                        if return_components:
+                            output_model_samples, m_output_model, u_output_model, l_output_model, components = x
+                        else:
+                            output_model_samples, m_output_model, u_output_model, l_output_model = x
                     else:
-                        output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths = x
+                        if return_components:
+                            output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths, components = x
+                        else:
+                            output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths = x
                 else:
                     if resolution is None:
-                        output_model_samples, output_model = x
+                        if return_components:
+                            output_model_samples, output_model, components = x
+                        else:
+                            output_model_samples, output_model = x
                     else:
-                        output_model_samples, output_model, output_model_wavelengths = x
+                        if return_components:
+                            output_model_samples, output_model, output_model_wavelengths, components = x
+                        else:
+                            output_model_samples, output_model, output_model_wavelengths = x
             else:
                 if return_err:
                     if resolution is None:
-                        m_output_model, u_output_model, l_output_model = x
+                        if return_components:
+                            m_output_model, u_output_model, l_output_model, components = x
+                        else:
+                            m_output_model, u_output_model, l_output_model = x
                     else:
-                        m_output_model, u_output_model, l_output_model, output_model_wavelengths = x
+                        if return_components:
+                            m_output_model, u_output_model, l_output_model, output_model_wavelengths, components = x
+                        else:
+                            m_output_model, u_output_model, l_output_model, output_model_wavelengths = x
                 else:
                     if resolution is None:
-                        output_model = x
+                        if return_components:
+                            output_model, components = x
+                        else:
+                            output_model = x
                     else:
-                        output_model, output_model_wavelengths = x
+                        if return_components:
+                            output_model, output_model_wavelengths, components = x
+                        else:
+                            output_model, output_model_wavelengths = x
         
         if return_samples:
             if return_err:
                 if resolution is None:
-                    return output_model_samples, m_output_model, u_output_model, l_output_model
+                    if return_components:
+                        return output_model_samples, m_output_model, u_output_model, l_output_model, components
+                    else:
+                        return output_model_samples, m_output_model, u_output_model, l_output_model
                 else:
-                    return output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths
+                    if return_components:
+                        return output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths, components
+                    else:
+                        return output_model_samples, m_output_model, u_output_model, l_output_model, output_model_wavelengths
             else:
                 if resolution is None:
-                    return output_model_samples, output_model
+                    if return_components:
+                        return output_model_samples, output_model, components
+                    else:
+                        return output_model_samples, output_model
                 else:
-                    return output_model_samples, output_model, output_model_wavelengths
+                    if return_components:
+                        return output_model_samples, output_model, output_model_wavelengths, components
+                    else:
+                        return output_model_samples, output_model, output_model_wavelengths
         else:
             if return_err:
                 if resolution is None:
-                    return m_output_model, u_output_model, l_output_model
+                    if return_components:
+                        return m_output_model, u_output_model, l_output_model, components
+                    else:
+                        return m_output_model, u_output_model, l_output_model
                 else:
-                    return m_output_model, u_output_model, l_output_model, output_model_wavelengths
+                    if return_components:
+                        return m_output_model, u_output_model, l_output_model, output_model_wavelengths, components
+                    else:
+                        return m_output_model, u_output_model, l_output_model, output_model_wavelengths
             else:
                 if resolution is None:
-                    return output_model
+                    if return_components:
+                        return output_model, components
+                    else:
+                        return output_model
                 else:
-                    return output_model, output_model_wavelengths
+                    if return_components:
+                        return output_model, output_model_wavelengths, components
+                    else:
+                        return output_model, output_model_wavelengths
 
     def generate_forward_models(self, parameter_values, rebin):
         ## Okay now we want to generate the forward model for each instrument using the parameter values.
@@ -1261,96 +1812,180 @@ class model(object):
         ## We will loop through the instruments and generate the model spectrum for each instrument using the SpectralModel class from petitRADTRANS (or the appropriate class for the chosen forward model code).
 
         self.modelOK = True
+
+        ## With composition priors, compute the VMRs once (they are the same for all instruments);
+        ## invalid compositions (CLR points outside the floor) are rejected without calling the forward model.
+        if self.composition is not None:
+            theta = composition.theta_from_parameters(parameter_values, self.composition)
+            X, valid = composition.params_to_vmr(theta, self.composition)
+            if not valid:
+                self.modelOK = False
+                return
+            self.composition_vmr = { sp: float(x) for sp, x in X.items() }
         
         for ins in self.instruments:
-            if self.data.code == 'petit':
-                # Alright, we will generate the forward model using petitRADTRANS for this instrument.
 
-                self.set_abundances(ins=ins, parameter_values=parameter_values)
-                
-                ## Setting up other planetary parameters
-                ### Calculating and extracting the stellar radius in cm
-                rst = parameter_values['rst']
-                rst_cm = ( rst * u.R_sun ).to(u.cm).value
+            ## We do the calculation ONLY is there is temperature profile available for this instrument. Otherwise the spectrum is simply zeros
+            if self.data_dict[ins]['temperature_profile'] is not None:
 
-                rp = ( parameter_values['rprs'] * rst * u.R_sun ).to(u.cm).value
-                self.models[ins].model_parameters['planet_radius'] = rp
+                if self.data.code == 'petit':
+                    # Alright, we will generate the forward model using petitRADTRANS for this instrument.
 
-                ### Either mass or surface gravity must be provided.
-                if self.data_dict['mass_fit']:
-                    mp = parameter_values['mp'] * u.M_earth
-                    #self.models[ins].model_parameters['planet_mass'] = mp.to(u.g).value
-                    # Converting the mass to surface gravity using the radius:
-                    g = ( con.G * mp / ( rp * u.cm )**2 ).to(u.cm / u.s**2).value
-                    self.models[ins].model_parameters['reference_gravity'] = g
-                else:
-                    self.models[ins].model_parameters['reference_gravity'] = parameter_values['surfgrav']
+                    self.set_abundances(ins=ins, parameter_values=parameter_values)
+                    
+                    ## Setting up other planetary parameters
+                    ### Calculating and extracting the stellar radius in cm
+                    rst = parameter_values['rst']
+                    rst_cm = ( rst * u.R_sun ).to(u.cm).value
 
-                ## Reference pressure
-                self.models[ins].model_parameters['reference_pressure'] = parameter_values['refP']
+                    rp = ( parameter_values['rprs'] * rst * u.R_sun ).to(u.cm).value
+                    self.models[ins].model_parameters['planet_radius'] = rp
 
-                ## Convolution settings for the model
-                if self.convolve:
-                    if 'FORWARD' in self.data.mode.keys():
-                        self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power
+                    ### Either mass or surface gravity must be provided.
+                    if self.data_dict['mass_fit']:
+                        mp = parameter_values['mp'] * u.M_earth
+                        #self.models[ins].model_parameters['planet_mass'] = mp.to(u.g).value
+                        # Converting the mass to surface gravity using the radius:
+                        g = ( con.G * mp / ( rp * u.cm )**2 ).to(u.cm / u.s**2).value
+                        self.models[ins].model_parameters['reference_gravity'] = g
                     else:
-                        self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power[ins]
+                        self.models[ins].model_parameters['reference_gravity'] = parameter_values['surfgrav']
 
-                ## See if the user has provided cloud top pressure
-                if self.data_dict[ins]['gray_cloud']:
-                    self.models[ins].model_parameters['opaque_cloud_top_pressure'] = parameter_values['ctp' + self.ctp_inames[ins]]
+                    ## Reference pressure
+                    self.models[ins].model_parameters['reference_pressure'] = parameter_values['refP']
 
-                ## Setting the parameters for haze factor
-                if self.data_dict[ins]['haze']:
-                    self.models[ins].model_parameters['haze_factor'] = parameter_values['hazefac' + self.haze_inames[ins]]
+                    ## Convolution settings for the model
+                    if self.convolve:
+                        if 'FORWARD' in self.data.mode.keys():
+                            self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power
+                        else:
+                            self.models[ins].model_parameters['convolve_resolving_power'] = self.resolving_power[ins]
 
-                ## Let's check the sum of the abundances of all species (it should ideally be 1)
-                ## In case there are filling species, we do not calculate the absolute abundances of the filling species, but rather, their ratio.
-                ## So in that case, we need to check that the sum of the non-filling species' abundances is less than or equal to 1
-                if len(self.data_dict[ins]['filling_species']) == 0:
-                    ## That means there no filling species, so the sum of all species' abundances should ideally be 1
-                    total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
-                    if not np.isclose(total_abundance, 1.0):
-                        print(f"Total abundance of all species should ideally be 1, but got {total_abundance}")
-                        self.modelOK = False
+                    ## See if the user has provided cloud top pressure
+                    if self.data_dict[ins]['gray_cloud']:
+                        self.models[ins].model_parameters['opaque_cloud_top_pressure'] = parameter_values['ctp' + self.ctp_inames[ins]]
+
+                    ## Setting the parameters for haze factor
+                    if self.data_dict[ins]['haze']:
+                        self.models[ins].model_parameters['haze_factor'] = parameter_values['hazefac' + self.haze_inames[ins]]
+
+                    ## Let's check the sum of the abundances of all species (it should ideally be 1)
+                    ## In case there are filling species, we do not calculate the absolute abundances of the filling species, but rather, their ratio.
+                    ## So in that case, we need to check that the sum of the non-filling species' abundances is less than or equal to 1
+                    ## With composition priors, the abundances sum to 1 by construction, so no check is needed.
+                    if self.composition is None and len(self.data_dict[ins]['filling_species']) == 0:
+                        ## That means there no filling species, so the sum of all species' abundances should ideally be 1
+                        total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
+                        if not np.isclose(total_abundance, 1.0):
+                            print(f"Total abundance of all species should ideally be 1, but got {total_abundance}")
+                            self.modelOK = False
+                    elif self.composition is None:
+                        ## There are filling species, so the sum of the non-filling species' abundances should be less than or equal to 1
+                        total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
+                        if total_abundance > 1.0:
+                            print(f"Total abundance of non-filling species should be less than or equal to 1, but got {total_abundance}")
+                            self.modelOK = False
+
+                    ## ------ Setting the temperature profile parameters
+                    if self.data_dict[ins]['temperature_profile'] == 'isothermal':
+                        self.models[ins].model_parameters['T_iso'] = parameter_values['isotemp' + self.tp_inames[ins] ]
+
+                    # ------ Calculating the spectrum
+                    if self.data_dict[ins]['petitTrans']:
+                        if rebin:
+                            self.models[ins].model_parameters['rebinned_wavelengths'] = ( self.data.wavelength[ins] * u.micron ).to(u.cm).value
+
+                        if self.modelOK:
+                            with warnings.catch_warnings():
+                                if self.composition is not None:
+                                    ## All species are imposed with mass fractions summing to 1; pRT warns about sums < 1 at the 1e-16 level.
+                                    warnings.filterwarnings('ignore', message='the sum of mass mixing ratios')
+                                forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin, convolve=self.convolve)
+                            self.model_spec[ins]['wavelength'] = ( forward_wav_model[0,:] * u.cm ).to(u.micron).value
+                            self.model_spec[ins]['spectrum'] = ( ( forward_spec_model[0,:] / rst_cm )**2 ) * 1e6
+                        else:
+                            self.model_spec[ins]['wavelength'], self.model_spec[ins]['spectrum'] = np.copy(self.data.wavelength[ins]), np.ones(len(self.data.wavelength[ins]))
+
                 else:
-                    ## There are filling species, so the sum of the non-filling species' abundances should be less than or equal to 1
-                    total_abundance = np.sum([ self.models[ins].model_parameters['imposed_mass_fractions'][key] for key in self.models[ins].model_parameters['imposed_mass_fractions'].keys() ])
-                    if total_abundance > 1.0:
-                        print(f"Total abundance of non-filling species should be less than or equal to 1, but got {total_abundance}")
-                        self.modelOK = False
-
-                ## Setting the parameters for temperature profile
-                if self.data_dict[ins]['petitIsoTrans']:
-                    self.models[ins].model_parameters['temperature_profile_mode'] = 'isothermal'
-                    self.models[ins].model_parameters['temperature'] = parameter_values['isotemp' + self.tp_inames[ins] ]
-
-                    if rebin:
-                        self.models[ins].model_parameters['rebinned_wavelengths'] = ( self.data.wavelength[ins] * u.micron ).to(u.cm).value
-
-                    if self.modelOK:
-                        forward_wav_model, forward_spec_model = self.models[ins].calculate_spectrum(mode='transmission', rebin=rebin, convolve=self.convolve)
-                        forward_wav_model = ( forward_wav_model[0,:] * u.cm ).to(u.micron).value
-                        forward_spec_model = ( ( forward_spec_model[0,:] / rst_cm )**2 ) * 1e6
-                    else:
-                        forward_wav_model, forward_spec_model = np.copy(self.data.wavelength[ins]), np.ones(len(self.data.wavelength[ins]))
-
-                # We don't need offset and sigma_w for forward models
-                if 'FORWARD' in self.data.mode.keys():
-                    parameter_values['offset_' + ins ] = 0.0
-                    parameter_values['sigma_w_' + ins ] = 0.0
-
-                self.model_spec[ins]['wavelength'] = forward_wav_model
-                self.model_spec[ins]['spectrum'] = forward_spec_model + parameter_values['offset_' + ins ]
-
-                if 'FORWARD' not in self.data.mode.keys():
-                    self.model_spec[ins]['variances'] = self.data.depth_err[ins] ** 2 + parameter_values['sigma_w_' + ins ] ** 2
+                    raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.data.code}")
 
             else:
-                raise NotImplementedError(f"Currently only petitRADTRANS is supported for models. Unsupported code: {self.data.code}")
+                ## Okay so temperature profile is None, i.e., no planetary model, but we are still fitting a line or a non-linear func, or a GP func
+                ## We may need to access wavelength array in that case, so re-creating it!
+                if rebin:
+                    self.model_spec[ins]['wavelength'] = np.copy( self.data.wavelength[ins] )
+                    self.model_spec[ins]['spectrum'] = np.zeros( len(self.data.wavelength[ins]) )
+                else:
+                    ## Original high resolution, however, the atmospheric model hasn't run in this case, so we need to define a high-res wavelength grid by ourselves
+                    self.model_spec[ins]['wavelength'] = np.linspace( np.min(self.data.wavelength[ins]), np.max(self.data.wavelength[ins]), 1000 )
+                    self.model_spec[ins]['spectrum'] = np.zeros( 1000 )
 
+            # We will ensure that offset and sigma_w parameters exist for this instrument, setting them to 0 if they are not provided.
+            if 'offset_' + ins not in parameter_values.keys():
+                parameter_values['offset_' + ins ] = 0.0
+            if 'sigma_w_' + ins not in parameter_values.keys():
+                parameter_values['sigma_w_' + ins ] = 0.0
+            
+            self.model_spec[ins]['deterministic'] = self.model_spec[ins]['spectrum'] + parameter_values['offset_' + ins ]
+
+            ## Checking if the instrument has a linear model (LM); and if it has, adding it to the deterministic model
+            if self.data_dict[ins]['has_LM']:
+                for j in range( self.data.LM_regressors[ins].shape[1] ):
+                    if rebin:
+                        ## Re-binning the model spectrum to the data resolution (i.e., no change in linear regressor, which is already at the data resolution)
+                        self.model_spec[ins]['LM'] = parameter_values['theta' + str(j) + self.lm_inames[str(j) + ins]] * self.data.LM_regressors[ins][:, j]
+                    else:
+                        ## No re-binning; i.e., the spectrum is at the original resolution, i.e., the linear regressors need to match this resolution
+                        ## We will interpolate the linear regressor to match the original resolution of the spectrum
+                        self.model_spec[ins]['LM'] = parameter_values['theta' + str(j) + self.lm_inames[str(j) + ins]] * np.interp(self.model_spec[ins]['wavelength'], self.data.wavelength[ins], self.data.LM_regressors[ins][:, j])
+                    self.model_spec[ins]['deterministic'] += self.model_spec[ins]['LM']
+
+            ## Checking if the instrument has a non-linear model (NLM); and if it has, adding it to the deterministic model
+            if self.data_dict[ins]['has_NLM']:
+                ### Same as above for rebinning
+                if rebin:
+                    self.model_spec[ins]['NLM'] = self.data.NLM[ins]['function'](self.data.NLM[ins]['regressors'], parameter_values)
+                else:
+                    self.model_spec[ins]['NLM'] = self.data.NLM[ins]['function'](np.interp(self.model_spec[ins]['wavelength'], self.data.wavelength[ins], self.data.NLM[ins]['regressors']), parameter_values)
+                self.model_spec[ins]['deterministic'] += self.model_spec[ins]['NLM']
+
+            if 'FORWARD' not in self.data.mode.keys():
+                self.model_spec[ins]['variances'] = self.data.depth_err[ins] ** 2 + parameter_values['sigma_w_' + ins ] ** 2
+
+
+    def line_abundance(self, ins, ls, parameter_values):
+        ## Abundance of line species ls (with the resolution suffix, if any) from the parameter values.
+        if type( self.data.resolution[ins] ) == int:
+            ls1 = ls.split('.')[0]
+        else:
+            ls1 = ls
+        if ls in self.data_dict[ins]['log_line_species']:
+            return 10 ** parameter_values[ 'line-log' + ls1 + self.line_inames[ins] ]
+        else:
+            return parameter_values[ 'line-' + ls1 + self.line_inames[ins] ]
+
+    def set_composition_abundances(self, ins):
+        ## With composition priors, all species (listed + background) have VMRs; clip them at X_min and impose mass fractions for all of them.
+        _, _, mass_fractions = composition.vmr_to_mass_fractions(self.composition_vmr, self.composition['X_min'])
+
+        ## Names of species with line opacities (e.g., CO2.R250 for CO2)
+        opacity_names = {}
+        for ls in self.data_dict[ins]['line_species']:
+            if type( self.data.resolution[ins] ) == int:
+                opacity_names[ ls.split('.')[0] ] = ls
+            else:
+                opacity_names[ls] = ls
+
+        self.models[ins].model_parameters['imposed_mass_fractions'] = {}
+        for species in mass_fractions.keys():
+            self.models[ins].model_parameters['imposed_mass_fractions'][ opacity_names.get(species, species) ] = float(mass_fractions[species])
+        self.models[ins].model_parameters['filling_species'] = {}
 
     def set_abundances(self, ins, parameter_values):
+        if self.composition is not None:
+            self.set_composition_abundances(ins)
+            return
+
         ## List of line species for this instrument.
         self.models[ins].model_parameters['imposed_mass_fractions'] = {}
 
@@ -1363,17 +1998,7 @@ class model(object):
                 ## However, they are filling species, so they will not have priors. So, we need to skip them in this loop.
                 continue
 
-            ## If the resolution is int, then the name of the species would be something like 'CO2.R200'. 
-            ## Let's leave resolution out of the name of the species (used in case if petit_vmr is True).
-            if type( self.data.resolution[ins] ) == int:
-                ls1 = ls.split('.')[0]
-            else:
-                ls1 = ls
-
-            if self.data_dict[ins]['logabundance']:
-                abundance = 10 ** parameter_values[ 'line-log' + ls1 + self.line_inames[ins] ]
-            else:
-                abundance = parameter_values[ 'line-' + ls1 + self.line_inames[ins] ]
+            abundance = self.line_abundance(ins, ls, parameter_values)
             
             if not self.data.petit_vmr:
                 ## If petit_vmr is False, then we assume that the user has provided mass fractions directly.
@@ -1409,18 +2034,10 @@ class model(object):
             all_species_abundances = {}
             ## First, add the line species:
             for ls in self.data_dict[ins]['line_species']:
-                if type( self.data.resolution[ins] ) == int:
-                    ls1 = ls.split('.')[0]
-                else:
-                    ls1 = ls
-
                 if ls in self.data_dict[ins]['filling_line_species']:
                     continue
 
-                if self.data_dict[ins]['logabundance']:
-                    abundance = 10 ** parameter_values[ 'line-log' + ls1 + self.line_inames[ins] ]
-                else:
-                    abundance = parameter_values[ 'line-' + ls1 + self.line_inames[ins] ]
+                abundance = self.line_abundance(ins, ls, parameter_values)
 
                 all_species_abundances[ls] = abundance * np.ones(5)
 
@@ -1452,10 +2069,166 @@ class model(object):
         return -0.5 * (len(residuals) * log2pi + np.sum(-np.log(taus.astype(float)) + taus * (residuals**2)))
     
 
-    def get_loglikelihood(self):
+    def get_loglikelihood(self, parameter_values):
         # This function will calculate the log-likelihood.
         log_like = 0.0
         for ins in self.instruments:
-            resids = self.data.depth[ins] - self.model_spec[ins]['spectrum']
-            log_like += self.gaussian_log_likelihood(resids, self.model_spec[ins]['variances'])
+            resids = self.data.depth[ins] - self.model_spec[ins]['deterministic']
+
+            if not self.data_dict[ins]['has_GP']:
+                log_like += self.gaussian_log_likelihood(resids, self.model_spec[ins]['variances'])
+            else:
+                try:
+                    ## Write code to update the GP parameters
+                    self.data_dict[ins]['noise_model'].update_GP(parameter_values)
+                    log_like += self.data_dict[ins]['noise_model'].GP.log_likelihood(resids)
+                except Exception as e:
+                    log_like = -np.inf
+                    raise Exception(
+                        'ERROR: Failed to compute GP log-likelihood for instrument ' +
+                        ins + '.\n' + str(e)
+                    )
+
         return log_like
+
+class GaussianProcesses(object):
+    def __init__(self, data, instrument, matern_eps=0.01):
+        self.isInit = False
+
+        # Name of input instrument if given:
+        self.instrument = instrument
+        self.sigma_factor = 1e-6                    # White noise term
+
+        self.X = data.GP_regressors[instrument]     # Input GP regressor
+        self.yerr = data.depth_err[instrument]      # Error on the transit depth
+
+        # Define all possible kernels available by the object:
+        self.all_kernel_variables = {}
+
+        self.all_kernel_variables['CeleriteExpKernel'] = ['sigma', 'timescale']
+        self.all_kernel_variables['CeleriteMaternKernel'] = ['sigma', 'rho']
+        self.all_kernel_variables['CeleriteMaternExpKernel'] = ['sigma', 'timescale', 'rho']
+        self.all_kernel_variables['CeleriteSHOKernel'] = ['S0', 'Q', 'rho']
+        self.all_kernel_variables['CeleriteDoubleSHOKernel'] = ['sigma', 'Q0', 'period', 'f', 'dQ']
+
+        # Find kernel name (and save it to self.kernel_name):
+        self.kernel_name = self.get_kernel_name(data.priors)
+        
+        # Initialize variable for the GP object:
+        self.GP = None
+        
+        # Initialize variable that sets the "instrument" name for each variable (self.variables below). If, for example,
+        # GP_Prot_TESS_K2_RV and GP_Gamma_TESS, and self.variables = [Prot,Gamma], then self.instrument_variables = ['TESS_K2_RV','TESS'].
+        self.input_instrument = []
+
+        # Initialize each kernel on the GP object. First, set the variables to the ones defined above. Then initialize the
+        # actual kernel:
+        self.variables = self.all_kernel_variables[self.kernel_name]
+        if self.kernel_name == 'CeleriteExpKernel':
+            # Generate exponential kernel:
+            self.kernel = terms.RealTerm(a=10., c=10.)
+            
+        elif self.kernel_name == 'CeleriteMaternKernel':
+            # Generate matern kernel:
+            self.kernel = terms.Matern32Term(sigma=10., rho=10., eps=matern_eps)
+            
+        elif self.kernel_name == 'CeleriteMaternExpKernel':
+            # Generate matern and exponential kernels:
+            matern_kernel = terms.Matern32Term(sigma=1., rho=10., eps=matern_eps)
+            exp_kernel = terms.RealTerm(a=10., c=10.)
+            
+            self.kernel = exp_kernel * matern_kernel
+            
+        elif self.kernel_name == 'CeleriteSHOKernel':
+            # Generate kernel:
+            self.kernel = terms.SHOTerm(S0=10., Q=10., rho=10.)
+            
+        elif self.kernel_name == 'CeleriteDoubleSHOKernel':
+            # Generate kernel
+            self.kernel = terms.RotationTerm(sigma=10., period=10., Q0=10., dQ=10., f=10.)
+
+        # Check that the regressor is ordered. If not, don't do the self.init_GP():
+        idx_sorted = np.argsort(self.X)
+        lX = len(self.X)
+        diff1 = np.count_nonzero(self.X - self.X[idx_sorted])
+        diff2 = np.count_nonzero(self.X - self.X[idx_sorted[::-1]])
+        if diff1 == 0 or diff2 == 0:
+            self.GP = celerite2.GaussianProcess(self.kernel, mean=0.0)
+            self.isInit = True
+
+        #self.parameter_vector = np.zeros( len(self.variables) + phantomvariable )
+        self.set_input_instrument(data.priors)
+
+    def get_kernel_name(self, priors):
+        # First, check all the GP variables in the priors file that are of the form GP_variable_instrument1_instrument2_...:
+        variables_that_match = []
+        
+        for pname in priors.keys():
+            vec = pname.split('_')
+            if (vec[0] == 'GP') and (self.instrument in vec):
+                variables_that_match = variables_that_match + [ vec[1] ]
+        
+        # Now we have all the variables that match the current instrument in variables_that_match. Check which of the
+        # implemented GP models gives a perfect match to all the variables; that will give us the name of the kernel:
+        n_variables_that_match = len(variables_that_match)
+        if n_variables_that_match == 0:
+            raise Exception(
+                'Input error: it seems instrument ' + self.instrument +
+                ' has no defined priors in the prior file for a Gaussian Process. Check the prior file and try again.'
+            )
+
+        for kernel_name in self.all_kernel_variables.keys():
+            counter = 0
+            for variable_name in self.all_kernel_variables[kernel_name]:
+                if variable_name in variables_that_match:
+                    counter += 1
+            if (n_variables_that_match == counter) and (len(self.all_kernel_variables[kernel_name]) == n_variables_that_match):
+                return kernel_name
+
+    def set_input_instrument(self, input_variables):
+        # This function sets the "input instrument" (self.input_instrument) name for each variable (self.variables).
+        # If, for example, GP_Prot_TESS_K2_rv and GP_Gamma_TESS, and self.variables = ['Prot','Gamma'],
+        # then self.input_instrument = ['TESS_K2_rv','TESS'].
+        for i in range( len(self.variables) ):
+            GPvariable = self.variables[i]
+            for pnames in input_variables.keys():
+                vec = pnames.split('_')
+                if (vec[0] == 'GP') and (GPvariable in vec[1]) and (self.instrument in vec):
+                    self.input_instrument.append( '_'.join(vec[2:]) )
+
+    def update_GP(self, parameter_values):
+        # Calculating the jitter term
+        jitter = parameter_values['sigma_w_' + self.instrument] * self.sigma_factor
+
+        ## And now updating th GP parameters with the given values
+        if self.kernel_name == 'CeleriteExpKernel':
+            self.kernel.a = parameter_values['GP_sigma_' + self.input_instrument[0]]
+            self.kernel.c = parameter_values['GP_timescale_' + self.input_instrument[1]]
+
+        elif self.kernel_name == 'CeleriteMaternKernel':
+            self.kernel.sigma = parameter_values['GP_sigma_' + self.input_instrument[0]]
+            self.kernel.rho = parameter_values['GP_rho_' + self.input_instrument[1]]
+
+        elif self.kernel_name == 'CeleriteMaternExpKernel':
+            self.kernel.term1.a = parameter_values['GP_sigma_' + self.input_instrument[0]]
+            self.kernel.term1.c = parameter_values['GP_timescale_' + self.input_instrument[1]]
+
+            self.kernel.term2.rho = parameter_values['GP_rho_' + self.input_instrument[2]]
+
+        elif self.kernel_name == 'CeleriteSHOKernel':
+            self.kernel.S0 = parameter_values['GP_S0_' + self.input_instrument[0]]
+            self.kernel.Q = parameter_values['GP_Q_' + self.input_instrument[1]]
+            self.kernel.rho = parameter_values['GP_rho_' + self.input_instrument[2]]
+
+        elif self.kernel_name == 'CeleriteDoubleSHOKernel':
+            self.kernel.sigma = parameter_values['GP_sigma_' + self.input_instrument[0]]
+            self.kernel.Q0 = parameter_values['GP_Q0_' + self.input_instrument[1]]
+            self.kernel.period = parameter_values['GP_period_' + self.input_instrument[2]]
+            self.kernel.f = parameter_values['GP_f_' + self.input_instrument[3]]
+            self.kernel.dQ = parameter_values['GP_dQ_' + self.input_instrument[4]]
+
+        # Update the GP with the given parameter values
+        if self.yerr is not None:
+            self.GP.compute(self.X, diag=self.yerr**2 + jitter**2, quiet=True)
+        else:
+            self.GP.compute(self.X, quiet=True)
