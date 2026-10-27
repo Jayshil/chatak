@@ -18,6 +18,12 @@ try:
 except:
     print('Warning: MultiNest (pymultinest) not found. MultiNest sampler cannot be used.')
 
+try:
+    import celerite2
+    from celerite2 import terms
+except ImportError:
+    print('Warning: celerite2 not found. celerite2 cannot be used for GP detrending.')
+
 import dynesty
 from dynesty.utils import resample_equal
 import astropy.units as u
@@ -44,12 +50,13 @@ class load(object):
         'rayleigh_species': [],
         'code': 'petit',
         'petit_vmr': False,
+        'matern_eps': 0.01,
     }
 
     def __init__(self, wavelength=None, depth=None, depth_err=None, wav_band=None, res_func=None, priors=None, mode=None,\
                  pressure_range=None, pressure_points=None, wavelength_range=None, filling_species=None, filling_line=None,\
                  cia=None, rayleigh_species=None, resolution='c-k', code=None, petit_vmr=None, LM_regressors=None, GP_regressors=None,\
-                 NLM=None, pout=None, pin=None, verbose=False):
+                 NLM=None, pout=None, pin=None, matern_eps=None, verbose=False):
         # Normal runs save wavelength-space inputs and per-instrument modes.
         # Forward runs only need priors and output location.
         # Model settings (pressure grid, filling/CIA/Rayleigh species, etc.) are saved in setup.txt for every run;
@@ -64,6 +71,7 @@ class load(object):
             'rayleigh_species': rayleigh_species,
             'code': code,
             'petit_vmr': petit_vmr,
+            'matern_eps': matern_eps,
         }
 
         self.wavelength = wavelength
@@ -719,6 +727,9 @@ class load(object):
             self.data_dict[ self.instruments[i] ]['has_GP'] = False
             self.data_dict[ self.instruments[i] ]['has_NLM'] = False
 
+            ### If there is GP, then we also initialise the GP object for this instrument.
+            self.data_dict[ self.instruments[i] ]['noise_model'] = None#GaussianProcesses(self, instrument=self.instruments[i], matern_eps=self.matern_eps)
+
         ## Checking if any of the instruments have linear, GP, or non-linear regressors and updating the flags accordingly.
         for i in range( len(self.instruments) ):
             if self.LM_regressors is not None:
@@ -728,6 +739,14 @@ class load(object):
             if self.GP_regressors is not None:
                 if self.GP_regressors.get(self.instruments[i], None) is not None:
                     self.data_dict[ self.instruments[i] ]['has_GP'] = True
+                    self.data_dict[ self.instruments[i] ]['noise_model'] = GaussianProcesses(self, instrument=self.instruments[i], matern_eps=self.matern_eps)
+                    if not self.data_dict[ self.instruments[i] ]['noise_model'].isInit:
+                        # Blame the user, although perhaps we could simply solve this as for the global modelling?:
+                        raise Exception(
+                            'INPUT ERROR: GP regressors for instrument ' +
+                            self.instruments[i] +
+                            ' use celerite2, and are not in ascending or descending order. Please, give the input in those orders --- it will not work othersie.'
+                        )
             
             if self.NLM is not None:
                 if self.NLM.get(self.instruments[i], None) is not None:
@@ -1273,7 +1292,7 @@ class fit(object):
         if self.data.wavelength is not None:
             self.model.generate(self.posteriors, True)
             if self.model.modelOK:
-                log_likelihood += self.model.get_loglikelihood()
+                log_likelihood += self.model.get_loglikelihood(self.posteriors)
             else:
                 return -1e101
         
@@ -1382,6 +1401,7 @@ class model(object):
                 self.model_spec[ins]['deterministic'] = np.zeros_like( self.data.depth[ins] )
                 self.model_spec[ins]['LM'] = np.zeros_like( self.data.depth[ins] )
                 self.model_spec[ins]['NLM'] = np.zeros_like( self.data.depth[ins] )
+                self.model_spec[ins]['GP'] = np.zeros_like( self.data.depth[ins] )
             else:
                 self.model_spec[ins]['wavelength'] = np.zeros( 1000 )  # Placeholder wavelength array for forward runs; actual wavelengths will depend on the forward model setup.
                 self.model_spec[ins]['spectrum'] = np.zeros( 1000 )  # Placeholder spectrum array for forward runs; actual values will be computed by the forward model.
@@ -1390,6 +1410,7 @@ class model(object):
                 self.model_spec[ins]['deterministic'] = np.zeros( 1000 )
                 self.model_spec[ins]['LM'] = np.zeros( 1000 )
                 self.model_spec[ins]['NLM'] = np.zeros( 1000 )
+                self.model_spec[ins]['GP'] = np.zeros( 1000 )
 
             for pri in self.priors.keys():
                 if pri[0:4].lower() == 'line':
@@ -1529,6 +1550,17 @@ class model(object):
                 'Warning: model evaluated at the posterior median did not compute properly.'
             )
 
+    def get_GP_plus_deterministic_model(self, parameter_values, instrument=None, Xpred=None):
+        if self.data_dict[instrument]['has_GP']:
+            self.data_dict[instrument]['noise_model'].update_GP(parameter_values)
+            if Xpred is None:
+                self.model_spec[instrument]['GP'] = self.data_dict[instrument]['noise_model'].GP.predict(y=self.residuals, t=self.data_dict[instrument]['noise_model'].X, return_cov=False)
+            else:
+                self.model_spec[instrument]['GP'] = self.data_dict[instrument]['noise_model'].GP.predict(y=self.residuals, t=Xpred, return_cov=False)
+            return self.model_spec[instrument]['deterministic'], self.model_spec[instrument]['GP'], self.model_spec[instrument]['deterministic'] + self.model_spec[instrument]['GP']
+        else:
+            return self.model_spec[instrument]['deterministic']
+
 
     def evaluate_model(self, instrument = None, parameter_values = None, all_samples = False, nsamples = 1000, return_samples = False, 
                        resolution = None, return_err = False, return_components = False, alpha = 0.68):
@@ -1582,6 +1614,7 @@ class model(object):
                     if return_components:
                         lm_samples = np.zeros([ nsamples, len( self.data.depth[instrument] ) ])
                         nlm_samples = np.zeros([ nsamples, len( self.data.depth[instrument] ) ])
+                        gp_samples = np.zeros([ nsamples, len( self.data.depth[instrument] ) ])
 
                 else:
                     ## If resolution is provided, then we generate models at those resolutions
@@ -1601,6 +1634,7 @@ class model(object):
                     if return_components:
                         lm_samples = np.zeros([ nsamples, len( self.model_spec[instrument]['spectrum'] ) ])
                         nlm_samples = np.zeros([ nsamples, len( self.model_spec[instrument]['spectrum'] ) ])
+                        gp_samples = np.zeros([ nsamples, len( self.model_spec[instrument]['spectrum'] ) ])
                     
                     ## Okay if the model resolution is not the same as the data resolution, then we also need to provide wavelengths
                     output_model_wavelengths = np.zeros( len( self.model_spec[instrument]['spectrum'] ) )
@@ -1611,14 +1645,33 @@ class model(object):
                     for parameter in input_parameters:
                         # Populate the current parameter_values
                         current_parameter_values[parameter] = parameter_values[parameter][idx_samples[i]]
+
+                    ## If resolution is specified, i.e., we need models, including GP, at higher resolution.
+                    ## TO calculate the GP models at the higher resolution, we still need to calculate the residuals at the data resolution
+                    ## Which we can then use to predict the GP model at the higher resolution.
+                    if resolution is not None:
+                        self.generate_forward_models(current_parameter_values, rebin=True)
+                        self.residuals = self.data.depth[instrument] - self.model_spec[instrument]['deterministic']
                     
                     if resolution is None:
                         self.generate_forward_models(current_parameter_values, rebin=True)
+                        self.residuals = self.data.depth[instrument] - self.model_spec[instrument]['deterministic']
+                        if self.data_dict[instrument]['has_GP']:
+                            _, gp_model, _ = self.get_GP_plus_deterministic_model(current_parameter_values, instrument)
+                            if return_components:
+                                gp_samples[i,:] = gp_model
                     else:
                         self.generate_forward_models(current_parameter_values, rebin=False)
                         output_model_wavelengths = self.model_spec[instrument]['wavelength']
+                        ## Now if there is a GP model, we can calculate it at the higher resolution using the residuals
+                        if self.data_dict[instrument]['has_GP']:
+                            # In this case, we still need to calculate the GP regressor at the higher resolution, we will do this by interpolating the wavelength
+                            Xpred = np.interp(output_model_wavelengths, self.data.wavelength[instrument], self.data.GP_regressors[instrument])
+                            _, gp_model, _ = self.get_GP_plus_deterministic_model(current_parameter_values, instrument, Xpred=Xpred)
+                            if return_components:
+                                gp_samples[i,:] = gp_model
                     
-                    output_model_samples[i,:] = self.model_spec[instrument]['deterministic']
+                    output_model_samples[i,:] = self.model_spec[instrument]['deterministic'] + gp_model
                     if return_components:
                         lm_samples[i,:] = self.model_spec[instrument]['LM']
                         nlm_samples[i,:] = self.model_spec[instrument]['NLM']
@@ -1631,26 +1684,30 @@ class model(object):
                     
                     ## Generating quantiles
                     for i in range(output_model_samples.shape[1]):
-                            m_output_model[i], u_output_model[i], l_output_model[i] = get_quantiles(output_model_samples[:, i], alpha=alpha)
+                        m_output_model[i], u_output_model[i], l_output_model[i] = get_quantiles(output_model_samples[:, i], alpha=alpha)
                 else:
                     output_model = np.nanmedian(output_model_samples, axis=0)
 
                 if return_components:
                     components['LM'] = np.nanmedian(lm_samples, axis=0)
                     components['NLM'] = np.nanmedian(nlm_samples, axis=0)
+                    components['GP'] = np.nanmedian(gp_samples, axis=0)
                     
             else:
                 ## This means that the parameter values are single values. We will generate the model spectrum for those values.
                 if resolution is None:
                     self.generate_forward_models(parameter_values, rebin=True)
+                    if self.data_dict[instrument]['has_GP']:
+                        _, gp_model, _ = self.get_GP_plus_deterministic_model(parameter_values, instrument=instrument)
                 else:
                     self.generate_forward_models(parameter_values, rebin=False)
                     output_model_wavelengths = self.model_spec[instrument]['wavelength']
 
-                output_model = self.model_spec[instrument]['deterministic']
+                output_model = self.model_spec[instrument]['deterministic'] + gp_model
                 if return_components:
                     components['LM'] = self.model_spec[instrument]['LM']
                     components['NLM'] = self.model_spec[instrument]['NLM']
+                    components['GP'] = gp_model
 
         else:
             ## We will use the posteriors to generate the model spectrum.
@@ -1857,6 +1914,7 @@ class model(object):
                 ## We may need to access wavelength array in that case, so re-creating it!
                 if rebin:
                     self.model_spec[ins]['wavelength'] = np.copy( self.data.wavelength[ins] )
+                    self.model_spec[ins]['spectrum'] = np.zeros( len(self.data.wavelength[ins]) )
                 else:
                     ## Original high resolution, however, the atmospheric model hasn't run in this case, so we need to define a high-res wavelength grid by ourselves
                     self.model_spec[ins]['wavelength'] = np.linspace( np.min(self.data.wavelength[ins]), np.max(self.data.wavelength[ins]), 1000 )
@@ -2011,10 +2069,166 @@ class model(object):
         return -0.5 * (len(residuals) * log2pi + np.sum(-np.log(taus.astype(float)) + taus * (residuals**2)))
     
 
-    def get_loglikelihood(self):
+    def get_loglikelihood(self, parameter_values):
         # This function will calculate the log-likelihood.
         log_like = 0.0
         for ins in self.instruments:
             resids = self.data.depth[ins] - self.model_spec[ins]['deterministic']
-            log_like += self.gaussian_log_likelihood(resids, self.model_spec[ins]['variances'])
+
+            if not self.data_dict[ins]['has_GP']:
+                log_like += self.gaussian_log_likelihood(resids, self.model_spec[ins]['variances'])
+            else:
+                try:
+                    ## Write code to update the GP parameters
+                    self.data_dict[ins]['noise_model'].update_GP(parameter_values)
+                    log_like += self.data_dict[ins]['noise_model'].GP.log_likelihood(resids)
+                except Exception as e:
+                    log_like = -np.inf
+                    raise Exception(
+                        'ERROR: Failed to compute GP log-likelihood for instrument ' +
+                        ins + '.\n' + str(e)
+                    )
+
         return log_like
+
+class GaussianProcesses(object):
+    def __init__(self, data, instrument, matern_eps=0.01):
+        self.isInit = False
+
+        # Name of input instrument if given:
+        self.instrument = instrument
+        self.sigma_factor = 1e-6                    # White noise term
+
+        self.X = data.GP_regressors[instrument]     # Input GP regressor
+        self.yerr = data.depth_err[instrument]      # Error on the transit depth
+
+        # Define all possible kernels available by the object:
+        self.all_kernel_variables = {}
+
+        self.all_kernel_variables['CeleriteExpKernel'] = ['sigma', 'timescale']
+        self.all_kernel_variables['CeleriteMaternKernel'] = ['sigma', 'rho']
+        self.all_kernel_variables['CeleriteMaternExpKernel'] = ['sigma', 'timescale', 'rho']
+        self.all_kernel_variables['CeleriteSHOKernel'] = ['S0', 'Q', 'rho']
+        self.all_kernel_variables['CeleriteDoubleSHOKernel'] = ['sigma', 'Q0', 'period', 'f', 'dQ']
+
+        # Find kernel name (and save it to self.kernel_name):
+        self.kernel_name = self.get_kernel_name(data.priors)
+        
+        # Initialize variable for the GP object:
+        self.GP = None
+        
+        # Initialize variable that sets the "instrument" name for each variable (self.variables below). If, for example,
+        # GP_Prot_TESS_K2_RV and GP_Gamma_TESS, and self.variables = [Prot,Gamma], then self.instrument_variables = ['TESS_K2_RV','TESS'].
+        self.input_instrument = []
+
+        # Initialize each kernel on the GP object. First, set the variables to the ones defined above. Then initialize the
+        # actual kernel:
+        self.variables = self.all_kernel_variables[self.kernel_name]
+        if self.kernel_name == 'CeleriteExpKernel':
+            # Generate exponential kernel:
+            self.kernel = terms.RealTerm(a=10., c=10.)
+            
+        elif self.kernel_name == 'CeleriteMaternKernel':
+            # Generate matern kernel:
+            self.kernel = terms.Matern32Term(sigma=10., rho=10., eps=matern_eps)
+            
+        elif self.kernel_name == 'CeleriteMaternExpKernel':
+            # Generate matern and exponential kernels:
+            matern_kernel = terms.Matern32Term(sigma=1., rho=10., eps=matern_eps)
+            exp_kernel = terms.RealTerm(a=10., c=10.)
+            
+            self.kernel = exp_kernel * matern_kernel
+            
+        elif self.kernel_name == 'CeleriteSHOKernel':
+            # Generate kernel:
+            self.kernel = terms.SHOTerm(S0=10., Q=10., rho=10.)
+            
+        elif self.kernel_name == 'CeleriteDoubleSHOKernel':
+            # Generate kernel
+            self.kernel = terms.RotationTerm(sigma=10., period=10., Q0=10., dQ=10., f=10.)
+
+        # Check that the regressor is ordered. If not, don't do the self.init_GP():
+        idx_sorted = np.argsort(self.X)
+        lX = len(self.X)
+        diff1 = np.count_nonzero(self.X - self.X[idx_sorted])
+        diff2 = np.count_nonzero(self.X - self.X[idx_sorted[::-1]])
+        if diff1 == 0 or diff2 == 0:
+            self.GP = celerite2.GaussianProcess(self.kernel, mean=0.0)
+            self.isInit = True
+
+        #self.parameter_vector = np.zeros( len(self.variables) + phantomvariable )
+        self.set_input_instrument(data.priors)
+
+    def get_kernel_name(self, priors):
+        # First, check all the GP variables in the priors file that are of the form GP_variable_instrument1_instrument2_...:
+        variables_that_match = []
+        
+        for pname in priors.keys():
+            vec = pname.split('_')
+            if (vec[0] == 'GP') and (self.instrument in vec):
+                variables_that_match = variables_that_match + [ vec[1] ]
+        
+        # Now we have all the variables that match the current instrument in variables_that_match. Check which of the
+        # implemented GP models gives a perfect match to all the variables; that will give us the name of the kernel:
+        n_variables_that_match = len(variables_that_match)
+        if n_variables_that_match == 0:
+            raise Exception(
+                'Input error: it seems instrument ' + self.instrument +
+                ' has no defined priors in the prior file for a Gaussian Process. Check the prior file and try again.'
+            )
+
+        for kernel_name in self.all_kernel_variables.keys():
+            counter = 0
+            for variable_name in self.all_kernel_variables[kernel_name]:
+                if variable_name in variables_that_match:
+                    counter += 1
+            if (n_variables_that_match == counter) and (len(self.all_kernel_variables[kernel_name]) == n_variables_that_match):
+                return kernel_name
+
+    def set_input_instrument(self, input_variables):
+        # This function sets the "input instrument" (self.input_instrument) name for each variable (self.variables).
+        # If, for example, GP_Prot_TESS_K2_rv and GP_Gamma_TESS, and self.variables = ['Prot','Gamma'],
+        # then self.input_instrument = ['TESS_K2_rv','TESS'].
+        for i in range( len(self.variables) ):
+            GPvariable = self.variables[i]
+            for pnames in input_variables.keys():
+                vec = pnames.split('_')
+                if (vec[0] == 'GP') and (GPvariable in vec[1]) and (self.instrument in vec):
+                    self.input_instrument.append( '_'.join(vec[2:]) )
+
+    def update_GP(self, parameter_values):
+        # Calculating the jitter term
+        jitter = parameter_values['sigma_w_' + self.instrument] * self.sigma_factor
+
+        ## And now updating th GP parameters with the given values
+        if self.kernel_name == 'CeleriteExpKernel':
+            self.kernel.a = parameter_values['GP_sigma_' + self.input_instrument[0]]
+            self.kernel.c = parameter_values['GP_timescale_' + self.input_instrument[1]]
+
+        elif self.kernel_name == 'CeleriteMaternKernel':
+            self.kernel.sigma = parameter_values['GP_sigma_' + self.input_instrument[0]]
+            self.kernel.rho = parameter_values['GP_rho_' + self.input_instrument[1]]
+
+        elif self.kernel_name == 'CeleriteMaternExpKernel':
+            self.kernel.term1.a = parameter_values['GP_sigma_' + self.input_instrument[0]]
+            self.kernel.term1.c = parameter_values['GP_timescale_' + self.input_instrument[1]]
+
+            self.kernel.term2.rho = parameter_values['GP_rho_' + self.input_instrument[2]]
+
+        elif self.kernel_name == 'CeleriteSHOKernel':
+            self.kernel.S0 = parameter_values['GP_S0_' + self.input_instrument[0]]
+            self.kernel.Q = parameter_values['GP_Q_' + self.input_instrument[1]]
+            self.kernel.rho = parameter_values['GP_rho_' + self.input_instrument[2]]
+
+        elif self.kernel_name == 'CeleriteDoubleSHOKernel':
+            self.kernel.sigma = parameter_values['GP_sigma_' + self.input_instrument[0]]
+            self.kernel.Q0 = parameter_values['GP_Q0_' + self.input_instrument[1]]
+            self.kernel.period = parameter_values['GP_period_' + self.input_instrument[2]]
+            self.kernel.f = parameter_values['GP_f_' + self.input_instrument[3]]
+            self.kernel.dQ = parameter_values['GP_dQ_' + self.input_instrument[4]]
+
+        # Update the GP with the given parameter values
+        if self.yerr is not None:
+            self.GP.compute(self.X, diag=self.yerr**2 + jitter**2, quiet=True)
+        else:
+            self.GP.compute(self.X, quiet=True)
