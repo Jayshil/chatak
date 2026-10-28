@@ -48,6 +48,7 @@ class load(object):
         'filling_line': [],
         'cia': [],
         'rayleigh_species': [],
+        'lbl_line_sampling': 1,
         'code': 'petit',
         'petit_vmr': False,
         'matern_eps': 0.01,
@@ -55,8 +56,8 @@ class load(object):
 
     def __init__(self, wavelength=None, depth=None, depth_err=None, wav_band=None, res_func=None, priors=None, mode=None,\
                  pressure_range=None, pressure_points=None, wavelength_range=None, filling_species=None, filling_line=None,\
-                 cia=None, rayleigh_species=None, resolution='c-k', code=None, petit_vmr=None, LM_regressors=None, GP_regressors=None,\
-                 NLM=None, pout=None, pin=None, matern_eps=None, verbose=False):
+                 cia=None, rayleigh_species=None, resolution='c-k', lbl_line_sampling=None, code=None, petit_vmr=None,\
+                 LM_regressors=None, GP_regressors=None, NLM=None, pout=None, pin=None, matern_eps=None, verbose=False):
         # Normal runs save wavelength-space inputs and per-instrument modes.
         # Forward runs only need priors and output location.
         # Model settings (pressure grid, filling/CIA/Rayleigh species, etc.) are saved in setup.txt for every run;
@@ -69,6 +70,7 @@ class load(object):
             'filling_line': filling_line,
             'cia': cia,
             'rayleigh_species': rayleigh_species,
+            'lbl_line_sampling': lbl_line_sampling,
             'code': code,
             'petit_vmr': petit_vmr,
             'matern_eps': matern_eps,
@@ -894,6 +896,7 @@ class load(object):
                                                                     gas_continuum_contributors=self.cia,
                                                                     wavelength_boundaries=[self.data_dict[ self.instruments[i] ]['wav_min'], self.data_dict[ self.instruments[i] ]['wav_max']],
                                                                     line_opacity_mode=self.data_dict[ self.instruments[i] ]['opacity_mode'],
+                                                                    line_by_line_opacity_sampling=self.lbl_line_sampling,
                                                                     ## Temperature profile function
                                                                     model_functions_map={'temperatures': self.data_dict[ self.instruments[i] ]['temperature_profile_func']}
                                                                     )
