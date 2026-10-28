@@ -1893,10 +1893,11 @@ class model(object):
                     if self.data_dict[ins]['temperature_profile'] == 'isothermal':
                         self.models[ins].model_parameters['T_iso'] = parameter_values['isotemp' + self.tp_inames[ins] ]
 
+                    if rebin:
+                        self.models[ins].model_parameters['rebinned_wavelengths'] = ( self.data.wavelength[ins] * u.micron ).to(u.cm).value
+
                     # ------ Calculating the spectrum
                     if self.data_dict[ins]['petitTrans']:
-                        if rebin:
-                            self.models[ins].model_parameters['rebinned_wavelengths'] = ( self.data.wavelength[ins] * u.micron ).to(u.cm).value
 
                         if self.modelOK:
                             with warnings.catch_warnings():
