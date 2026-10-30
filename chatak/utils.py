@@ -1,18 +1,13 @@
 import numpy as np
-from scipy.stats import gamma, norm, beta, truncnorm, lognorm
-from scipy.special import logsumexp, expit
+from scipy.stats import gamma, norm, beta, truncnorm
+from scipy.interpolate import CubicSpline, interp1d
+from scipy.special import expit
 try:
     from petitRADTRANS.physics import (
-        cubic_spline_profile,
         dtdp_temperature_profile,
-        flux2irradiance,
-        linear_spline_profile,
         madhu_seager_2009,
-        planck_function_cm,
         power_law_temperature_profile,
-        temperature_profile_function_guillot_global,
-        temperature_profile_function_isothermal,
-        temperature_profile_function_ret_model
+        temperature_profile_function_guillot_global
     )
 except:
     pass
@@ -137,3 +132,27 @@ def transform_modifiedjeffreys(x, hyperparameters):
 # --------------------- Temperature profile functions
 def TP_isothermal(pressures, T_iso, **kwargs):
     return np.ones_like(pressures) * T_iso
+
+def TP_guillot(pressures, T_int, T_eq, kappa_IR, surf_grav, g, **kwargs):
+    return temperature_profile_function_guillot_global(pressures=pressures, infrared_mean_opacity=kappa_IR, gamma=g, gravities=surf_grav, \
+                                                       intrinsic_temperature=T_int, equilibrium_temperature=T_eq)
+
+def TP_madhu_seager09(pressures, a1, a2, log10P1, log10P2, log10P3, Tref, b1, b2, **kwargs):
+    return madhu_seager_2009(pressures=pressures, log_pressure_points=[np.log10(pressures[0]), log10P1, log10P2, log10P3], T_set=Tref, alpha_points=[a1, a2], beta_points=[b1,b2])
+
+def TP_power_law(pressures, T0, alpha, **kwargs):
+    return power_law_temperature_profile(press=pressures, alpha=alpha, T0=T0)
+
+def TP_gradient(pressures, gradients, Tbottom, Ptop, **kwargs):
+    return dtdp_temperature_profile(press=pressures, num_layer=len(gradients), layer_pt_slopes=gradients, t_bottom=Tbottom,\
+                                    top_of_atmosphere_pressure=Ptop, bottom_of_atmosphere_pressure=np.max(pressures))
+
+def TP_cubic_spline(pressures, T_points, **kwargs):
+    pressure_pt = np.linspace( np.min(np.log10(pressures)), np.max(np.log10(pressures)), len(T_points) )
+    cs = CubicSpline(pressure_pt, T_points)
+    return cs( np.log10(pressures) )
+
+def TP_linear_interpolation(pressures, T_points, **kwargs):
+    pressure_pt = np.linspace( np.min(np.log10(pressures)), np.max(np.log10(pressures)), len(T_points) )
+    interp = interp1d(pressure_pt, T_points, kind='linear', fill_value='extrapolate')
+    return interp( np.log10(pressures) )
