@@ -24,8 +24,12 @@ try:
 except ImportError:
     print('Warning: celerite2 not found. celerite2 cannot be used for GP detrending.')
 
-import dynesty
-from dynesty.utils import resample_equal
+try:
+    import dynesty
+    from dynesty.utils import resample_equal
+except ImportError:
+    print('Warning: dynesty not found. dynesty sampler cannot be used.')
+
 import astropy.units as u
 import astropy.constants as con
 from tqdm import tqdm
@@ -804,9 +808,19 @@ class load(object):
                             self.data_dict[ self.instruments[i] ]['temperature_profile'] = 'isothermal'
                             self.data_dict[ self.instruments[i] ]['temperature_profile_func'] = TP_isothermal
                             if self.verbose:
-                                print(f"Setting petitRADTRANS isothermal transmission fitting for instrument {self.instruments[i]}.")
+                                print(f"Setting petitRADTRANS isothermal temperature profile for instrument {self.instruments[i]}.")
                         else:
-                            raise NotImplementedError(f"Isothermal fitting is currently only implemented for petitRADTRANS. Unsupported code: {self.code}")
+                            raise NotImplementedError(f"Isothermal temperature profile is currently only implemented for petitRADTRANS. Unsupported code: {self.code}")
+
+                if pri[0:4].lower() == 'tint':
+                    if ( self.instruments[i] in pri.split('_') ) or ( len(pri.split('_')) == 1 ):
+                        if self.code == 'petit':
+                            self.data_dict[ self.instruments[i] ]['temperature_profile'] = 'guillot'
+                            self.data_dict[ self.instruments[i] ]['temperature_profile_func'] = TP_guillot
+                            if self.verbose:
+                                print(f"Setting petitRADTRANS Guillot temperature profile for instrument {self.instruments[i]}.")
+                        else:
+                            raise NotImplementedError(f"Guillot temperature profile is currently only implemented for petitRADTRANS. Unsupported code: {self.code}")
                         
                 if pri[0:4].lower() == 'line':
                     ## This means that the prior is for a line species.
@@ -1473,7 +1487,23 @@ class model(object):
                         ## This means that the prior is global (not instrument-dependent).
                         self.tp_inames[ins] = ''
                     else:
-                        raise Exception('Prior for isotemp species is not properly defined: must be, e.g., isotemp, isotemp_inst or isotemp_inst1_inst2. Currently is '+pri)
+                        raise Exception('Prior for isotemp is not properly defined: must be, e.g., isotemp, isotemp_inst or isotemp_inst1_inst2. Currently is '+pri)
+
+                if pri[0:4].lower() == 'tint':
+                    vec = pri.split('_')
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
+                        if ins in vec:
+                            self.tp_inames[ins] = '_' + '_'.join(vec[1:])
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.tp_inames[ins] = '_' + vec[1]
+                    elif len(vec) == 1:
+                        ## This means that the prior is global (not instrument-dependent).
+                        self.tp_inames[ins] = ''
+                    else:
+                        raise Exception('Prior for Tint is not properly defined: must be, e.g., Tint, Tint_inst or Tint_inst1_inst2. Currently is '+pri)
                 
                 if pri[0:7].lower() == 'hazefac':
                     vec = pri.split('_')
@@ -1892,6 +1922,18 @@ class model(object):
                     ## ------ Setting the temperature profile parameters
                     if self.data_dict[ins]['temperature_profile'] == 'isothermal':
                         self.models[ins].model_parameters['T_iso'] = parameter_values['isotemp' + self.tp_inames[ins] ]
+                    
+                    elif self.data_dict[ins]['temperature_profile'] == 'guillot':
+                        self.models[ins].model_parameters['T_int'] = parameter_values['Tint' + self.tp_inames[ins] ]
+                        self.models[ins].model_parameters['T_eq'] = parameter_values['Teq' + self.tp_inames[ins] ]
+                        self.models[ins].model_parameters['kappa_IR'] = parameter_values['kappaIR' + self.tp_inames[ins] ]
+                        self.models[ins].model_parameters['g'] = parameter_values['gamma' + self.tp_inames[ins] ]
+
+                        if self.data_dict['mass_fit']:
+                            self.models[ins].model_parameters['surf_grav'] = g
+                        else:
+                            self.models[ins].model_parameters['surf_grav'] = parameter_values['surfgrav']
+                        
 
                     if rebin:
                         self.models[ins].model_parameters['rebinned_wavelengths'] = ( self.data.wavelength[ins] * u.micron ).to(u.cm).value
