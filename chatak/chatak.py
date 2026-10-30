@@ -821,6 +821,17 @@ class load(object):
                                 print(f"Setting petitRADTRANS Guillot temperature profile for instrument {self.instruments[i]}.")
                         else:
                             raise NotImplementedError(f"Guillot temperature profile is currently only implemented for petitRADTRANS. Unsupported code: {self.code}")
+
+                if pri[0:7].lower() == 'log10p1':
+                    if ( self.instruments[i] in pri.split('_') ) or ( len(pri.split('_')) == 1 ):
+                        if self.code == 'petit':
+                            self.data_dict[ self.instruments[i] ]['temperature_profile'] = 'madhu'
+                            self.data_dict[ self.instruments[i] ]['temperature_profile_func'] = TP_madhu_seager09
+                            if self.verbose:
+                                print(f"Setting petitRADTRANS Madhusudhan & Seager (2009) temperature profile for instrument {self.instruments[i]}.")
+                        else:
+                            raise NotImplementedError(f"Madhusudhan & Seager (2009) temperature profile is currently only implemented for petitRADTRANS. Unsupported code: {self.code}")
+
                         
                 if pri[0:4].lower() == 'line':
                     ## This means that the prior is for a line species.
@@ -1504,6 +1515,22 @@ class model(object):
                         self.tp_inames[ins] = ''
                     else:
                         raise Exception('Prior for Tint is not properly defined: must be, e.g., Tint, Tint_inst or Tint_inst1_inst2. Currently is '+pri)
+
+                if pri[0:7].lower() == 'log10p1':
+                    vec = pri.split('_')
+                    if len(vec) > 2:
+                        ## This means that the prior is instrument-dependent (joint for multiple instruments).
+                        if ins in vec:
+                            self.tp_inames[ins] = '_' + '_'.join(vec[1:])
+                    elif len(vec) == 2:
+                        ## This means that the prior is instrument-dependent (specific to a single instrument).
+                        if ins in vec:
+                            self.tp_inames[ins] = '_' + vec[1]
+                    elif len(vec) == 1:
+                        ## This means that the prior is global (not instrument-dependent).
+                        self.tp_inames[ins] = ''
+                    else:
+                        raise Exception('Prior for log10p1 is not properly defined: must be, e.g., log10p1, log10p1_inst or log10p1_inst1_inst2. Currently is '+pri)
                 
                 if pri[0:7].lower() == 'hazefac':
                     vec = pri.split('_')
@@ -1933,6 +1960,24 @@ class model(object):
                             self.models[ins].model_parameters['surf_grav'] = g
                         else:
                             self.models[ins].model_parameters['surf_grav'] = parameter_values['surfgrav']
+
+                    elif self.data_dict[ins]['temperature_profile'] == 'madhu':
+                        self.models[ins].model_parameters['a1'] = parameter_values['a1' + self.tp_inames[ins] ]
+                        self.models[ins].model_parameters['a2'] = parameter_values['a2' + self.tp_inames[ins] ]
+                        self.models[ins].model_parameters['log10P1'] = parameter_values['log10P1' + self.tp_inames[ins] ]
+                        self.models[ins].model_parameters['log10P2'] = parameter_values['log10P2' + self.tp_inames[ins] ]
+                        self.models[ins].model_parameters['log10P3'] = parameter_values['log10P3' + self.tp_inames[ins] ]
+                        self.models[ins].model_parameters['Tref'] = parameter_values['Tref' + self.tp_inames[ins] ]
+                        
+                        try:
+                            self.models[ins].model_parameters['b1'] = parameter_values['b1' + self.tp_inames[ins] ]
+                        except:
+                            self.models[ins].model_parameters['b1'] = 0.5
+
+                        try:
+                            self.models[ins].model_parameters['b2'] = parameter_values['b2' + self.tp_inames[ins] ]
+                        except:
+                            self.models[ins].model_parameters['b2'] = 0.5
                         
 
                     if rebin:
